@@ -200,7 +200,7 @@ aikit-prompts/
 | `src/core/block.ts` | `block(role)` builder. Identical surface to `prompt()` but produces a `Block` with a role tag (`system`, `user`, `assistant`, `tool`). Also `block.examples([...])` for few-shot, and `block.cacheBreakpoint()` to mark a cache boundary translated by adapters into `cache_control: { type: 'ephemeral' }` (Anthropic) or the equivalent OpenAI prompt-cache hint. |
 | `src/core/tool.ts` | `tool({ name, description, parameters })` builder — first-class tool/function definitions distinct from the `'tool'` role. `parameters` accepts a JSON Schema object (or a `toJSONSchema()`-compatible value, e.g. from Zod/Valibot adapters in user code). Adapters render these as `tools: […]` in the OpenAI/Anthropic/AI SDK request payload, and the same builder is used for structured-output `response_format: { type: 'json_schema', schema }`. |
 | `src/core/compose.ts` | `compose(blocks, { tools?, responseSchema?, cache? })` → `Composition`. Renders to ordered `ChatMessage[]`. Handles partial-vars merging, per-block input typing via union/intersection, attaches tool defs and structured-output schemas to the composition for adapters to translate. |
-| `src/template-extras/index.ts` | Optional parser extension. Importing this subpath augments the parser at registration time with `{{#if}}`, `{{#each}}`, and `{{> partial}}` support. Core stays at substitution-only when this subpath is not imported. |
+| `src/template-extras/index.ts` | Optional parser extension. Exposes `withIfEach()` and `withPartials()` activator functions plus `registerPartial`/`unregisterPartial`. Callers must invoke the activator(s) once at app startup to register `{{#if}}`, `{{#each}}`, and `{{> partial}}` directives — the import itself is side-effect-free so `sideEffects: false` and tree-shaking guarantees hold. Core stays at substitution-only when these activators are not called. |
 | `src/core/template.ts` | Public `render(definition, vars)` plus `extract(definition)` for static analysis. Wraps the internal parser. |
 | `src/core/render-context.ts` | Shared context object passed down: variable values, escapers, partials. No public API. |
 | `src/core/types.ts` | `PromptDefinition`, `Block`, `Composition`, `ChatMessage`, `Role`, `Metadata`. All plain data, JSON-serializable. |
@@ -1045,6 +1045,17 @@ export interface HttpSourceOptions {
    * load remains in effect.
    */
   readonly verify?: VerifyFn;
+  /** Optional explicit source name. Default `http:<url>:<counter>`. */
+  readonly name?: string;
+  /**
+   * Optional polling interval in ms. When set, the source schedules a
+   * refresh after each successful fetch and emits diff events. Each tick
+   * carries 0–10% jitter; consecutive failures double the delay (capped at
+   * `pollMs * 2^30`) until the next success resets the backoff. Polling
+   * stops when there are no subscribers and resumes on the next
+   * `subscribe()` call.
+   */
+  readonly pollMs?: number;
 }
 
 export type VerifyFn = (body: string, response: Response) => boolean | Promise<boolean>;

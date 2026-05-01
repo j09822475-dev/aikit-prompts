@@ -3,7 +3,13 @@
  * `internal/` so any layer (testing, adapters, sources) can use it
  * without a cross-layer import.
  *
- * @param input UTF-8 string to hash.
+ * Hashes JS string code units (UTF-16) — not UTF-8 bytes — so two
+ * strings that are equal under `===` always produce the same hash, but
+ * the value will differ from a "real" UTF-8 FNV-1a for inputs
+ * containing non-ASCII characters. Stable for the in-process A/B
+ * bucketing and dedup paths the library uses it for.
+ *
+ * @param input String to hash.
  * @returns A 32-bit unsigned integer.
  */
 export function fnv1a32(input: string): number {

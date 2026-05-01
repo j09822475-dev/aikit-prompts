@@ -1,3 +1,4 @@
+import { encodingForModel, getEncoding } from 'js-tiktoken';
 import { CostError } from '../errors/cost-error.js';
 import type { TokenizerFn } from './types.js';
 
@@ -15,45 +16,25 @@ const ENCODING_OVERRIDES: Readonly<Record<string, string>> = Object.freeze({
 
 let warnedOnFallback = false;
 
-interface JsTiktokenModule {
-  encodingForModel?: (model: string) => {
-    encode: (text: string) => number[];
-  };
-  getEncoding?: (name: string) => { encode: (text: string) => number[] };
-}
-
-let cachedModule: JsTiktokenModule | undefined;
-
-const loadModule = async (): Promise<JsTiktokenModule> => {
-  if (cachedModule) return cachedModule;
-  try {
-    cachedModule = (await import(
-      'js-tiktoken'
-    )) as JsTiktokenModule;
-    return cachedModule;
-  } catch (cause) {
-    throw new CostError(
-      'COST_UNKNOWN_MODEL',
-      `tiktokenFor() requires the 'js-tiktoken' package — install it as a peer dependency.`,
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      { ...(cause !== undefined ? { cause } : {}) } as any,
-    );
-  }
-};
-
 /**
  * Build a `TokenizerFn` backed by `js-tiktoken` for the given model.
  *
- * The first invocation lazy-loads `js-tiktoken` (peer dependency); the
- * encoding is cached for subsequent calls. Unknown models fall back to
- * `cl100k_base` with a one-time `console.warn` and a tagged accuracy
- * id (`'tiktoken/cl100k_base (fallback)'`) so the caller can detect
- * the fallback at the value level.
+ * `js-tiktoken` is a synchronous peer dependency — the encoder is
+ * resolved up front so the returned tokenizer is safe to pass directly
+ * to `estimateCost({ tokenizer })`. The library never bundles
+ * `js-tiktoken` into core: this module ships as its own subpath entry
+ * (`@aikit/prompts/cost/tiktoken`) with `js-tiktoken` declared as an
+ * external in the bundler config.
+ *
+ * Unknown models fall back to `cl100k_base` with a one-time
+ * `console.warn` and a tagged `id` (`'tiktoken/cl100k_base (fallback)'`)
+ * so the caller can detect the fallback at the value level.
  *
  * @param model Model id (e.g. `'gpt-4o'`).
  * @returns A `TokenizerFn` accepted by `estimateCost({ tokenizer })`.
  *
- * @throws {CostError} (`code: 'COST_UNKNOWN_MODEL'`) when `js-tiktoken` cannot be loaded.
+ * @throws {CostError} (`code: 'COST_UNKNOWN_MODEL'`) when the encoder
+ *   cannot be constructed (e.g. corrupted `js-tiktoken` install).
  *
  * @example
  * import { estimateCost } from '@aikit/prompts/cost';
@@ -65,97 +46,50 @@ const loadModule = async (): Promise<JsTiktokenModule> => {
  * });
  */
 export function tiktokenFor(model: string): TokenizerFn {
-  let encoderPromise: Promise<{
-    encode: (text: string) => number[];
-    isFallback: boolean;
-    encodingName: string;
-  }> | undefined;
+  let encoder: { encode: (text: string) => number[] };
+  let encodingName: string;
 
-  const ensureEncoder = (): Promise<{
-    encode: (text: string) => number[];
-    isFallback: boolean;
-    encodingName: string;
-  }> => {
-    if (encoderPromise) return encoderPromise;
-    encoderPromise = loadModule().then((mod) => {
-      const overrideName = ENCODING_OVERRIDES[model];
-      if (overrideName && mod.getEncoding) {
-        return {
-          encode: mod.getEncoding(overrideName).encode,
-          isFallback: false,
-          encodingName: `tiktoken/${overrideName}`,
-        };
-      }
-      try {
-        if (mod.encodingForModel) {
-          return {
-            encode: mod.encodingForModel(model).encode,
-            isFallback: false,
-            encodingName: `tiktoken/${model}`,
-          };
-        }
-      } catch {
-        /* fall through to cl100k_base */
-      }
-      if (!warnedOnFallback) {
-        warnedOnFallback = true;
-        // eslint-disable-next-line no-console
-        console.warn(
-          `[@aikit/prompts] tiktokenFor('${model}') — model not recognized, ` +
-            `falling back to cl100k_base.`,
-        );
-      }
-      if (!mod.getEncoding) {
-        throw new CostError(
-          'COST_UNKNOWN_MODEL',
-          `js-tiktoken does not expose getEncoding; cannot fall back for '${model}'`,
-          { model },
-        );
-      }
-      return {
-        encode: mod.getEncoding('cl100k_base').encode,
-        isFallback: true,
-        encodingName: 'tiktoken/cl100k_base (fallback)',
-      };
-    });
-    return encoderPromise;
-  };
-
-  let resolved:
-    | { encode: (text: string) => number[]; encodingName: string }
-    | undefined;
+  const overrideName = ENCODING_OVERRIDES[model];
+  try {
+    if (overrideName) {
+      encoder = getEncoding(
+        overrideName as Parameters<typeof getEncoding>[0],
+      );
+      encodingName = `tiktoken/${overrideName}`;
+    } else {
+      encoder = encodingForModel(
+        model as Parameters<typeof encodingForModel>[0],
+      );
+      encodingName = `tiktoken/${model}`;
+    }
+  } catch {
+    if (!warnedOnFallback) {
+      warnedOnFallback = true;
+      // eslint-disable-next-line no-console
+      console.warn(
+        `[@aikit/prompts] tiktokenFor('${model}') — model not recognized, ` +
+          `falling back to cl100k_base.`,
+      );
+    }
+    try {
+      encoder = getEncoding('cl100k_base');
+    } catch (cause) {
+      throw new CostError(
+        'COST_UNKNOWN_MODEL',
+        `tiktokenFor('${model}') failed to load 'cl100k_base' fallback encoder.`,
+        { model, cause },
+      );
+    }
+    encodingName = 'tiktoken/cl100k_base (fallback)';
+  }
 
   const tokenizer: TokenizerFn = Object.assign(
-    (text: string): number => {
-      if (!resolved) {
-        throw new CostError(
-          'COST_UNKNOWN_MODEL',
-          `tiktokenFor('${model}') has not been awaited yet — ` +
-            `await tokenizer.ready() before passing it to estimateCost.`,
-          { model },
-        );
-      }
-      return resolved.encode(text).length;
-    },
+    (text: string): number => encoder.encode(text).length,
     {
-      id: `tiktoken/${model}`,
+      id: encodingName,
       accuracy: 'exact' as const,
     },
   );
-
-  Object.assign(tokenizer, {
-    /**
-     * Eagerly resolve the underlying encoder. Call this once before
-     * passing the tokenizer to `estimateCost` to avoid the synchronous
-     * `tiktokenFor()` call hitting the not-yet-loaded path.
-     */
-    ready: async (): Promise<TokenizerFn> => {
-      const e = await ensureEncoder();
-      resolved = { encode: e.encode, encodingName: e.encodingName };
-      Object.assign(tokenizer, { id: e.encodingName });
-      return tokenizer;
-    },
-  });
 
   return tokenizer;
 }

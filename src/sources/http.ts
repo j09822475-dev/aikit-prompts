@@ -1,5 +1,6 @@
 import { SourceError } from '../errors/source-error.js';
 import type { PromptDefinitionJson } from '../core/types.js';
+import { deepEqual } from '../internal/deep-equal.js';
 import { parsePromptRecords } from './parse.js';
 import type {
   PromptSource,
@@ -28,11 +29,18 @@ export interface HttpSourceOptions {
    */
   readonly verify?: VerifyFn;
   /**
-   * Optional explicit name. Defaults to `http:<url>`. Useful when
-   * multiple endpoints share an origin.
+   * Optional explicit name. Defaults to `http:<url>:<counter>`. Useful
+   * when multiple endpoints share an origin.
    */
   readonly name?: string;
-  /** Optional polling interval in ms — when set, source emits change events on each refresh. */
+  /**
+   * Optional polling interval in ms — when set, the source schedules a
+   * refresh after each successful fetch and emits diff events. Each
+   * scheduled tick adds 0–10% jitter; consecutive failures double the
+   * delay (capped at `pollMs * 2^30`) until the next success resets the
+   * backoff. Polling stops when no listener remains and resumes on the
+   * next `subscribe()`.
+   */
   readonly pollMs?: number;
 }
 
@@ -127,12 +135,15 @@ const fetchAndValidate = async (
  *   verify: verifyHmac({ secret, headerName: 'x-prompt-signature' }),
  * });
  */
+const POLL_BACKOFF_CAP_MULTIPLIER = 30;
+
 export function httpSource(options: HttpSourceOptions): PromptSource {
   const fetchFn = options.fetch ?? fetch;
   const name = options.name ?? `http:${options.url}:${++counter}`;
   let cached: readonly PromptDefinitionJson[] | undefined;
   let cachedAt = 0;
-  let pollTimer: ReturnType<typeof setInterval> | undefined;
+  let pollTimer: ReturnType<typeof setTimeout> | undefined;
+  let pollFailures = 0;
   const listeners = new Set<(event: SourceChangeEvent) => void>();
 
   const emit = (event: SourceChangeEvent): void => {
@@ -162,22 +173,35 @@ export function httpSource(options: HttpSourceOptions): PromptSource {
     }
   };
 
-  const startPolling = (): void => {
-    if (options.pollMs === undefined || pollTimer) return;
-    pollTimer = setInterval(() => {
+  const computeNextDelay = (basePollMs: number): number => {
+    const cappedFailures = Math.min(pollFailures, POLL_BACKOFF_CAP_MULTIPLIER);
+    const backoff = basePollMs * Math.max(1, 2 ** cappedFailures);
+    const jitter = Math.random() * (basePollMs * 0.1);
+    return backoff + jitter;
+  };
+
+  const schedulePoll = (basePollMs: number): void => {
+    pollTimer = setTimeout(() => {
       void (async (): Promise<void> => {
         const previous = cached ?? [];
         cached = undefined;
         cachedAt = 0;
-        let next: readonly PromptDefinitionJson[];
         try {
-          next = await loadOnce();
+          const next = await loadOnce();
+          pollFailures = 0;
+          diffAndEmit(previous, next, emit);
         } catch {
-          return;
+          pollFailures++;
+        } finally {
+          if (listeners.size > 0) schedulePoll(basePollMs);
         }
-        diffAndEmit(previous, next, emit);
       })();
-    }, options.pollMs);
+    }, computeNextDelay(basePollMs));
+  };
+
+  const startPolling = (): void => {
+    if (options.pollMs === undefined || pollTimer) return;
+    schedulePoll(options.pollMs);
   };
 
   return Object.freeze({
@@ -192,7 +216,7 @@ export function httpSource(options: HttpSourceOptions): PromptSource {
     },
     async dispose(): Promise<void> {
       if (pollTimer) {
-        clearInterval(pollTimer);
+        clearTimeout(pollTimer);
         pollTimer = undefined;
       }
       listeners.clear();
@@ -216,8 +240,7 @@ const diffAndEmit = (
     seen.add(key);
     const old = prev.get(key);
     if (!old) emit({ type: 'added', prompt: r });
-    else if (JSON.stringify(old) !== JSON.stringify(r))
-      emit({ type: 'replaced', prompt: r });
+    else if (!deepEqual(old, r)) emit({ type: 'replaced', prompt: r });
   }
   for (const r of previous) {
     if (!seen.has(keyOf(r)) && r.version !== undefined) {

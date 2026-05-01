@@ -167,6 +167,21 @@ const validateUniqueTools = (
   }
 };
 
+interface BreakpointCounters {
+  seen: number;
+  readonly toSkip: number;
+}
+
+const shouldHonor = (
+  block: Block<Role, Record<string, unknown>>,
+  cache: 'auto' | 'off',
+  counters: BreakpointCounters,
+): boolean => {
+  if (!block.cacheBreakpoint || cache !== 'auto') return false;
+  counters.seen++;
+  return counters.seen > counters.toSkip;
+};
+
 const renderBlocks = (
   blocks: ReadonlyArray<Block<Role, Record<string, unknown>>>,
   vars: Record<string, unknown>,
@@ -175,13 +190,14 @@ const renderBlocks = (
   totalBreakpoints: number,
 ): readonly ChatMessage[] => {
   const out: ChatMessage[] = [];
-  let breakpointsEmitted = 0;
   const breakpointsToHonor = Math.min(
     totalBreakpoints,
     ANTHROPIC_CACHE_BREAKPOINT_LIMIT,
   );
-  const breakpointsToSkip = totalBreakpoints - breakpointsToHonor;
-  let breakpointsSeen = 0;
+  const counters: BreakpointCounters = {
+    seen: 0,
+    toSkip: totalBreakpoints - breakpointsToHonor,
+  };
 
   for (const b of blocks) {
     if (b.examples.length > 0) {
@@ -204,34 +220,17 @@ const renderBlocks = (
         undefined,
       );
       const message: ChatMessage = { role: b.role, content: text };
-
-      const honorBreakpoint =
-        b.cacheBreakpoint && cache === 'auto' && (() => {
-          breakpointsSeen++;
-          if (breakpointsSeen <= breakpointsToSkip) return false;
-          breakpointsEmitted++;
-          return true;
-        })();
-
       out.push(
-        honorBreakpoint
+        shouldHonor(b, cache, counters)
           ? { ...message, cacheControl: 'ephemeral' as const }
           : message,
       );
     } else if (b.cacheBreakpoint && out.length > 0) {
       const last = out[out.length - 1];
-      if (cache === 'auto' && last !== undefined) {
-        breakpointsSeen++;
-        if (breakpointsSeen > breakpointsToSkip) {
-          breakpointsEmitted++;
-          out[out.length - 1] = { ...last, cacheControl: 'ephemeral' };
-        }
+      if (last !== undefined && shouldHonor(b, cache, counters)) {
+        out[out.length - 1] = { ...last, cacheControl: 'ephemeral' };
       }
     }
-  }
-
-  if (breakpointsEmitted > ANTHROPIC_CACHE_BREAKPOINT_LIMIT) {
-    warnBreakpointLimit(breakpointsEmitted);
   }
 
   return Object.freeze(out);

@@ -212,13 +212,13 @@ const makeBuilder = (
     metadata(meta) {
       checkLive(state, 'metadata');
       Object.assign(state.metadata, meta);
-      return builder as never;
+      return builder;
     },
 
     tags(...tags) {
       checkLive(state, 'tags');
       state.tags.push(...tags);
-      return builder as never;
+      return builder;
     },
 
     validate(fn) {
@@ -226,7 +226,7 @@ const makeBuilder = (
       state.validator = fn as (
         vars: Record<string, unknown>,
       ) => readonly string[];
-      return builder as never;
+      return builder;
     },
 
     build() {
@@ -257,7 +257,16 @@ const makeBuilder = (
           ): string {
             const merged: Record<string, unknown> = { ...partial, ...vars };
             if (validator) {
-              const errors = validator(merged);
+              let errors: readonly string[];
+              try {
+                errors = validator(merged);
+              } catch (cause) {
+                throw new VariableError(
+                  'VARIABLE_VALIDATION_FAILED',
+                  `validate() callback for prompt '${id}' threw`,
+                  { templateId: id, cause },
+                );
+              }
               if (errors.length > 0) {
                 throw new VariableError(
                   'VARIABLE_VALIDATION_FAILED',

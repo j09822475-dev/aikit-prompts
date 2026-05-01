@@ -86,7 +86,13 @@ export function toAISDK<TVars extends Record<string, unknown>>(
     };
   }
 
-  const messages = src.render(vars).map(toCoreMessage);
+  const rendered = src.render(vars);
+  let hasCache = false;
+  const messages: AISDKCoreMessage[] = [];
+  for (const m of rendered) {
+    if (m.cacheControl === 'ephemeral') hasCache = true;
+    messages.push(toCoreMessage(m));
+  }
 
   const out: {
     messages: readonly AISDKCoreMessage[];
@@ -110,10 +116,7 @@ export function toAISDK<TVars extends Record<string, unknown>>(
     out.experimental_output = { schema: src.responseSchema };
   }
 
-  if (
-    src.cache === 'auto' &&
-    src.render(vars).some((m) => m.cacheControl === 'ephemeral')
-  ) {
+  if (src.cache === 'auto' && hasCache) {
     out.providerOptions = {
       anthropic: { cacheControl: { type: 'ephemeral' } },
       openai: { cacheKey: 'auto' },

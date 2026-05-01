@@ -1,3 +1,4 @@
+import { VariableError } from '../../errors/variable-error.js';
 import type {
   ChatMessage,
   Composition,
@@ -38,12 +39,20 @@ const messageContent = (
   return parts;
 };
 
-const toMessage = (m: ChatMessage): OpenAIChatMessage => ({
-  role: m.role,
-  content: messageContent(m),
-  ...(m.name !== undefined ? { name: m.name } : {}),
-  ...(m.toolCallId !== undefined ? { tool_call_id: m.toolCallId } : {}),
-});
+const toMessage = (m: ChatMessage): OpenAIChatMessage => {
+  if (m.role === 'tool' && m.toolCallId === undefined) {
+    throw new VariableError(
+      'VARIABLE_TYPE_MISMATCH',
+      `OpenAI adapter requires every 'tool' role message to have a 'toolCallId'`,
+    );
+  }
+  return {
+    role: m.role,
+    content: messageContent(m),
+    ...(m.name !== undefined ? { name: m.name } : {}),
+    ...(m.toolCallId !== undefined ? { tool_call_id: m.toolCallId } : {}),
+  };
+};
 
 const cachePrefixHash = (messages: readonly ChatMessage[]): string => {
   const upTo = messages.findIndex((m) => m.cacheControl === 'ephemeral');
@@ -70,7 +79,8 @@ const cachePrefixHash = (messages: readonly ChatMessage[]): string => {
  * @param vars Required-keys input matching `src`'s `TVars`.
  * @returns `{ messages, tools?, response_format?, prompt_cache_key? }`.
  *
- * @throws {VariableError} when required vars are missing.
+ * @throws {VariableError} when required vars are missing or a `tool` role
+ *   message lacks a `toolCallId`.
  *
  * @example
  * import OpenAI from 'openai';

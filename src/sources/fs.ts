@@ -1,5 +1,6 @@
 import { SourceError } from '../errors/source-error.js';
 import type { PromptDefinitionJson } from '../core/types.js';
+import { deepEqual } from '../internal/deep-equal.js';
 import { parsePromptRecord } from './parse.js';
 import type { PromptSource, SourceChangeEvent } from './types.js';
 
@@ -267,8 +268,7 @@ const diffAndEmit = (
     seen.add(key);
     const old = prev.get(key);
     if (!old) emit({ type: 'added', prompt: r });
-    else if (JSON.stringify(old) !== JSON.stringify(r))
-      emit({ type: 'replaced', prompt: r });
+    else if (!deepEqual(old, r)) emit({ type: 'replaced', prompt: r });
   }
   for (const r of previous) {
     if (!seen.has(keyOf(r)) && r.version !== undefined) {

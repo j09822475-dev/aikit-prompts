@@ -61,7 +61,17 @@ const countTokens = (
   let total = 0;
   for (const text of texts) {
     if (text.length === 0) continue;
-    total += validateTokenCount(tokenizer(text, model), model);
+    let count: number;
+    try {
+      count = tokenizer(text, model);
+    } catch (cause) {
+      throw new CostError(
+        'COST_INVALID_TOKEN_COUNT',
+        `Tokenizer threw for model '${model}'`,
+        { model, cause },
+      );
+    }
+    total += validateTokenCount(count, model);
     total += PER_MESSAGE_OVERHEAD;
   }
   total += imageCount * imageBaseTokens;

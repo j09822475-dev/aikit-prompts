@@ -21,9 +21,12 @@ export class CostError extends PromptError {
   constructor(
     code: CostErrorCode,
     message: string,
-    details?: { model?: string },
+    details?: { model?: string; cause?: unknown },
   ) {
-    super(PromptError.withDocs(code as ErrorCode, message));
+    super(
+      PromptError.withDocs(code as ErrorCode, message),
+      details?.cause !== undefined ? { cause: details.cause } : undefined,
+    );
     this.code = code;
     if (details?.model !== undefined) this.model = details.model;
   }

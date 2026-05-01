@@ -18,10 +18,7 @@ const fromBase64 = (input: string, urlSafe: boolean): Uint8Array => {
     ? input.replace(/-/g, '+').replace(/_/g, '/')
     : input;
   while (normalized.length % 4 !== 0) normalized += '=';
-  const binary =
-    typeof atob === 'function'
-      ? atob(normalized)
-      : Buffer.from(normalized, 'base64').toString('binary');
+  const binary = atob(normalized);
   const out = new Uint8Array(binary.length);
   for (let i = 0; i < binary.length; i++) out[i] = binary.charCodeAt(i);
   return out;
