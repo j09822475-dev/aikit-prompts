@@ -15,8 +15,8 @@
 6. **Provider-agnostic core.** The core never imports OpenAI / Anthropic / Vercel AI SDK types. Adapters live in dedicated subpaths.
 7. **Deterministic by default.** A/B assignment, render output, and cost estimation produce the same result for the same inputs. No clocks, no `Math.random()` in the core.
 8. **Errors are typed and discriminable.** All thrown errors extend `PromptError` with a `code` literal union. Boundary functions that can predictably fail return a `Result<T, E>` instead of throwing.
-9. **Edge-runtime first.** No `node:fs`, `node:crypto`, or `Buffer` in the core or in the universal `sources/http` and `sources/memory` modules. Node-only sources (`sources/fs`) are isolated in their own subpath.
-10. **Bundle discipline.** Hard size budget enforced via `size-limit` in CI. Core ≤ 9 KB minified.
+9. **Edge-runtime first.** No `node:fs`, `node:crypto`, or `Buffer` in the core or in the universal `sources` barrel and `sources/http` module. Node-only sources (`sources/fs`) are isolated in their own subpath. Web Crypto (`SubtleCrypto`) is the only crypto primitive used (by `verifyHmac`), and it's universal across Node 18+, Bun, Deno, browsers, Vercel Edge, and Cloudflare Workers.
+10. **Bundle discipline.** Hard size budget enforced via `size-limit` in CI, measured **minified + gzip** to match ecosystem norms (size-limit's `preset-small-lib` default). Core ≤ 9 KB min+gz hard cap, 7 KB target. Iteration directives (`{{#if}}`, `{{#each}}`, `{{> partial}}`) live in the opt-in `template-extras` subpath so the 80% substitution-only case stays small.
 
 ---
 
@@ -42,11 +42,18 @@ aikit-prompts/
 │   │
 │   ├── core/
 │   │   ├── prompt.ts                  # `prompt()` builder + `PromptDefinition`
-│   │   ├── block.ts                   # `block()` builder for composition primitives
+│   │   ├── block.ts                   # `block()` builder, `cacheBreakpoint()` chain step
+│   │   ├── tool.ts                    # `tool()` builder — typed tool/function definitions
 │   │   ├── compose.ts                 # `compose()` — combines blocks into a Composition
 │   │   ├── template.ts                # template parser (AST), render(), variable extraction
 │   │   ├── render-context.ts          # runtime helpers shared by prompts and blocks
-│   │   └── types.ts                   # PromptDefinition, Block, Composition, Role, Message
+│   │   └── types.ts                   # PromptDefinition, Block, Composition, Tool, Role, Message, CacheBreakpoint
+│   │
+│   ├── template-extras/               # opt-in subpath: iteration directives, partials
+│   │   ├── index.ts                   # public barrel — `withIfEach()`, `withPartials()` parser extensions
+│   │   ├── if.ts                      # `{{#if var}}…{{/if}}` directive
+│   │   ├── each.ts                    # `{{#each items}}…{{/each}}` directive
+│   │   └── partial.ts                 # `{{> name}}` partial inclusion
 │   │
 │   ├── types/
 │   │   ├── extract-vars.ts            # `ExtractVariables<T>` template-literal-types magic
@@ -83,33 +90,36 @@ aikit-prompts/
 │   │
 │   ├── cost/
 │   │   ├── index.ts                   # public barrel
-│   │   ├── estimate.ts                # `estimateCost()` — orchestrates tokenizer+pricing
+│   │   ├── estimate.ts                # `estimateCost()` / `estimateTokens()` — heuristic by default
 │   │   ├── pricing.ts                 # built-in per-model price table (Apr 2026 snapshot)
 │   │   ├── pricing-registry.ts        # `registerModel()` for custom prices
-│   │   ├── tokenizer.ts               # heuristic tokenizer (~4 chars/token) + adapter type
+│   │   ├── tokenizer.ts               # rough heuristic (~4 chars/token) + `TokenizerFn` adapter type
+│   │   ├── tiktoken.ts                # OPTIONAL subpath `@aikit/prompts/cost/tiktoken` — lazy-imports `js-tiktoken` (peer-optional)
 │   │   └── types.ts                   # ModelPricing, CostEstimate, TokenizerFn
 │   │
 │   ├── sources/
-│   │   ├── index.ts                   # public barrel — re-exports universal sources
-│   │   ├── memory.ts                  # `memorySource()` — in-memory array
-│   │   ├── http.ts                    # `httpSource()` — fetch-based, edge-safe
+│   │   ├── index.ts                   # public barrel — exports `memorySource()` + `verifyHmac` helper (universal, edge-safe)
+│   │   ├── memory.ts                  # `memorySource()` — inlined into `sources` barrel (no separate subpath)
+│   │   ├── http.ts                    # `httpSource()` — fetch-based, edge-safe, HMAC/Ed25519 verify hook
 │   │   ├── fs.ts                      # `fsSource()` — Node-only, behind dynamic import
-│   │   ├── parse.ts                   # JSON/TOML-free serialized PromptDefinition parser
-│   │   └── types.ts                   # PromptSource, LoadResult, SourceOptions
+│   │   ├── verify.ts                  # `verifyHmac({ secret, headerName, algorithm })` — Web Crypto-based
+│   │   ├── parse.ts                   # JSON-only serialized PromptDefinition parser
+│   │   └── types.ts                   # PromptSource, LoadResult, SourceOptions, VerifyFn
 │   │
 │   ├── adapters/
 │   │   ├── openai/
-│   │   │   ├── index.ts               # `toOpenAI()` — converts Composition → ChatCompletion params
+│   │   │   ├── index.ts               # `toOpenAI<TVars>()` — Composition → ChatCompletion params, tool defs, structured-output schemas
 │   │   │   └── types.ts               # local re-typed view of openai shapes (no SDK import at runtime)
 │   │   ├── anthropic/
-│   │   │   ├── index.ts               # `toAnthropic()` → MessageCreateParams
+│   │   │   ├── index.ts               # `toAnthropic<TVars>()` → MessageCreateParams; `cache_control: { type: 'ephemeral' }` for cache breakpoints
 │   │   │   └── types.ts
 │   │   ├── ai-sdk/
-│   │   │   ├── index.ts               # `toAISDK()` → CoreMessage[] for `streamText`/`generateText`
+│   │   │   ├── index.ts               # `toAISDK<TVars>()` → CoreMessage[] for `streamText`/`generateText`
 │   │   │   └── types.ts
 │   │   └── langchain/
-│   │       ├── index.ts               # `toLangChain()` → BaseMessage[] (compat layer)
+│   │       ├── index.ts               # `toLangChain<TVars>()` → BaseMessage[] (compat layer)
 │   │       └── types.ts
+│   │       # `toMCP()` — planned for v0.2 (MCP prompt-template envelope), not v0.1.
 │   │
 │   └── internal/
 │       ├── parser.ts                  # template parser → TemplateAst
@@ -185,10 +195,12 @@ aikit-prompts/
 
 | Path | Responsibility |
 |---|---|
-| `src/index.ts` | Root barrel — re-exports `prompt`, `block`, `compose`, core types, `Result` helper. Does NOT re-export versioning/testing/cost/adapters (forces tree-shakeable subpath imports). |
-| `src/core/prompt.ts` | `prompt(id)` builder. Returns chainable `PromptBuilder<Vars>` with `.version()`, `.template()`, `.input<T>()`, `.partial()`, `.metadata()`, `.tags()`, `.validate()`, `.build()`. |
-| `src/core/block.ts` | `block(role)` builder. Identical surface to `prompt()` but produces a `Block` with a role tag (`system`, `user`, `assistant`, `tool`). Also `block.examples([...])` for few-shot. |
-| `src/core/compose.ts` | `compose(blocks)` → `Composition`. Renders to ordered `ChatMessage[]`. Handles partial-vars merging and per-block input typing via union/intersection. |
+| `src/index.ts` | Root barrel — re-exports `prompt`, `block`, `tool`, `compose`, core types, `Result` helper. Does NOT re-export versioning/testing/cost/adapters (forces tree-shakeable subpath imports). |
+| `src/core/prompt.ts` | `prompt(id)` builder. Returns chainable `PromptBuilder<Vars>` with `.version()`, `.template()`, `.input<T>()` (intersect, non-destructive), `.replaceInput<T>()` (destructive), `.partial()`, `.metadata()`, `.tags()`, `.validate()`, `.build()`. |
+| `src/core/block.ts` | `block(role)` builder. Identical surface to `prompt()` but produces a `Block` with a role tag (`system`, `user`, `assistant`, `tool`). Also `block.examples([...])` for few-shot, and `block.cacheBreakpoint()` to mark a cache boundary translated by adapters into `cache_control: { type: 'ephemeral' }` (Anthropic) or the equivalent OpenAI prompt-cache hint. |
+| `src/core/tool.ts` | `tool({ name, description, parameters })` builder — first-class tool/function definitions distinct from the `'tool'` role. `parameters` accepts a JSON Schema object (or a `toJSONSchema()`-compatible value, e.g. from Zod/Valibot adapters in user code). Adapters render these as `tools: […]` in the OpenAI/Anthropic/AI SDK request payload, and the same builder is used for structured-output `response_format: { type: 'json_schema', schema }`. |
+| `src/core/compose.ts` | `compose(blocks, { tools?, responseSchema?, cache? })` → `Composition`. Renders to ordered `ChatMessage[]`. Handles partial-vars merging, per-block input typing via union/intersection, attaches tool defs and structured-output schemas to the composition for adapters to translate. |
+| `src/template-extras/index.ts` | Optional parser extension. Importing this subpath augments the parser at registration time with `{{#if}}`, `{{#each}}`, and `{{> partial}}` support. Core stays at substitution-only when this subpath is not imported. |
 | `src/core/template.ts` | Public `render(definition, vars)` plus `extract(definition)` for static analysis. Wraps the internal parser. |
 | `src/core/render-context.ts` | Shared context object passed down: variable values, escapers, partials. No public API. |
 | `src/core/types.ts` | `PromptDefinition`, `Block`, `Composition`, `ChatMessage`, `Role`, `Metadata`. All plain data, JSON-serializable. |
@@ -207,16 +219,18 @@ aikit-prompts/
 | `src/cost/estimate.ts` | `estimateCost({ prompt, vars, model, tokenizer?, expectedOutputTokens? })`. |
 | `src/cost/pricing.ts` | Frozen per-model price table snapshot. Tagged with `pricingDate`. |
 | `src/cost/pricing-registry.ts` | Mutable map for custom/private models. `registerModel()`, `unregisterModel()`. |
-| `src/cost/tokenizer.ts` | Default heuristic: `Math.ceil(text.length / 4)`. Type for pluggable tokenizers (e.g. wraps `tiktoken`). |
-| `src/sources/memory.ts` | `memorySource(records)` — synchronous, useful for tests and seed data. |
-| `src/sources/http.ts` | `httpSource({ url, fetch?, headers?, ttlMs?, parser? })` — uses global `fetch`, optional TTL cache. |
+| `src/cost/tokenizer.ts` | Default heuristic: `Math.ceil(text.length / 4)` — **rough**, ~10% under for Latin and up to ~50% over for CJK. Documented prominently. Pluggable `TokenizerFn` type for real tokenizers. |
+| `src/cost/tiktoken.ts` | Subpath `@aikit/prompts/cost/tiktoken`. Lazy-loads `js-tiktoken` (peer-optional, not bundled into core). Exposes `tiktokenFor(model)`: returns a `TokenizerFn` callers pass to `estimateCost({ tokenizer })`. |
+| `src/sources/memory.ts` | `memorySource(records)` — synchronous; **inlined** into the `sources` barrel (no separate subpath export). |
+| `src/sources/http.ts` | `httpSource({ url, fetch?, headers?, ttlMs?, parser?, verify? })` — uses global `fetch`, optional TTL cache, optional integrity verification (`verify: (body, response) => boolean | Promise<boolean>`). |
+| `src/sources/verify.ts` | `verifyHmac({ secret, headerName, algorithm? })` — Web Crypto-based HMAC verifier, edge-safe, ready to plug into `httpSource({ verify })`. |
 | `src/sources/fs.ts` | `fsSource({ glob, watch?, parser? })` — uses `import('node:fs/promises')` lazily. Throws clear edge-runtime error if `fs` is unavailable. Watching uses `node:fs.watch` with debouncing. |
 | `src/sources/parse.ts` | Strict JSON parser for `PromptDefinitionJson`. Schema-validates structure and rejects unknown fields. |
 | `src/adapters/openai/index.ts` | `toOpenAI(composition, vars)` → `{ messages: ChatCompletionMessageParam[] }`. Multimodal parts mapped to OpenAI content blocks. |
 | `src/adapters/anthropic/index.ts` | `toAnthropic(composition, vars)` → `{ system, messages, metadata? }` matching `MessageCreateParams`. |
 | `src/adapters/ai-sdk/index.ts` | `toAISDK(composition, vars)` → `CoreMessage[]` (Vercel AI SDK shape). |
 | `src/adapters/langchain/index.ts` | `toLangChain(composition, vars)` → `BaseMessage[]`. Imports types only from `@langchain/core` (peer dep). |
-| `src/internal/parser.ts` | Tiny streaming parser (~120 LOC) returning `TemplateAst`. Supports `{{var}}`, `{{var?}}`, `{{var:number}}`, `{{#if var}}...{{/if}}`, `{{#each items}}...{{/each}}`, `{{> partial}}` and `{{!-- comment --}}`. |
+| `src/internal/parser.ts` | Tiny streaming parser (~80 LOC core) returning `TemplateAst`. Core supports `{{var}}`, `{{var?}}`, `{{var:number}}`, and `{{!-- comment --}}` only. Iteration directives (`{{#if}}`, `{{#each}}`, `{{> partial}}`) are added by `template-extras` via a parser-extension hook (`registerDirective(name, handler)`). This keeps the core parser footprint within the 7 KB min+gz target. |
 | `src/internal/escape.ts` | Identity by default (LLM input is not HTML). Provides `escapeMarkdown` and `escapeJson` opt-in helpers used by `.render({ escape: 'markdown' })`. |
 | `src/internal/invariant.ts` | `invariant(cond, msg)` — throws `PromptError` with code `'INVARIANT'`. Used for unreachable branches. |
 
@@ -252,24 +266,31 @@ import { prompt } from '@aikit/prompts';
  * greet.render({ name: 'Alice' });
  * //                  ~~~~~~~~~ Type error: missing 'count'
  */
-export function prompt(id: string): PromptBuilder<{}, never, undefined>;
+export function prompt(id: string): PromptBuilder;
 ```
 
-The chainable builder:
+> **DX note.** The exported `PromptBuilder` is a single-arg user-facing alias; the
+> three internal generics (`TInput`, `TPartialKeys`, `TVersion`) live on a private
+> `_PromptBuilder<TInput, TPartialKeys, TVersion>` type that the builder methods
+> return. Hovers show the **resolved** input shape via a `Prettify<T>` mapped type,
+> so users never see `PromptBuilder<{}, never, undefined>` in autocomplete — they
+> see `PromptBuilder<{ name: string; count: number }>`.
+
+The chainable builder (internal form, simplified for documentation):
 
 ```ts
-export interface PromptBuilder<
+type _PromptBuilder<
   TInput extends Record<string, unknown>,
   TPartialKeys extends keyof TInput,
   TVersion extends string | undefined,
-> {
+> = {
   /**
    * Attach a SemVer version. Multiple versions of the same `id` can coexist
    * inside a registry; `latest`/range selectors pick between them.
    *
    * @param semver `MAJOR.MINOR.PATCH` — pre-release tags allowed (`1.0.0-beta.1`).
    */
-  version<V extends string>(semver: V): PromptBuilder<TInput, TPartialKeys, V>;
+  version<V extends string>(semver: V): _PromptBuilder<TInput, TPartialKeys, V>;
 
   /**
    * Set the template body. Variable placeholders use `{{name}}` syntax.
@@ -282,18 +303,41 @@ export interface PromptBuilder<
    */
   template<T extends string>(
     body: T,
-  ): PromptBuilder<InputShape<T>, TPartialKeys, TVersion>;
+  ): _PromptBuilder<InputShape<T>, TPartialKeys, TVersion>;
 
   /**
-   * Override or refine the inferred input shape. Use this when the template
-   * uses nested objects you want strongly typed, or when you want to make a
-   * `string`-typed variable narrower (e.g. `'small' | 'medium' | 'large'`).
+   * Refine the inferred input shape. Non-destructive by default — the
+   * provided override is **intersected** with the template-inferred shape, so
+   * you can narrow a single variable to a literal union without restating
+   * every key:
    *
-   * Calling `.input<T>()` REPLACES the inferred shape — provide all keys.
+   *     prompt('p')
+   *       .template('Render at {{size}} for {{user}}')
+   *       .input<{ size: 'small' | 'medium' | 'large' }>()
+   *       .build()
+   *       .render({ size: 'small', user: 'alice' });
+   *       //                       ^^^^ still required, still inferred as string
+   *
+   * To completely replace the inferred shape (rare — typically only when the
+   * template references nested object paths the type-extractor cannot follow),
+   * use `.replaceInput<T>()` instead.
    */
-  input<TOverride extends Record<string, unknown>>(): PromptBuilder<
+  input<TOverride extends Partial<TInput>>(): _PromptBuilder<
+    Prettify<Omit<TInput, keyof TOverride> & TOverride>,
+    Extract<TPartialKeys, keyof (Omit<TInput, keyof TOverride> & TOverride)>,
+    TVersion
+  >;
+
+  /**
+   * Replace the inferred input shape entirely. Destructive — provide every
+   * key the template needs. Prefer `.input<T>()` for the common case of
+   * narrowing one or two keys; reach for `.replaceInput<T>()` only when the
+   * inferred shape is fundamentally wrong (deep nested objects, dynamic key
+   * sets, etc.).
+   */
+  replaceInput<TOverride extends Record<string, unknown>>(): _PromptBuilder<
     TOverride,
-    TPartialKeys & keyof TOverride,
+    Extract<TPartialKeys, keyof TOverride>,
     TVersion
   >;
 
@@ -314,7 +358,7 @@ export interface PromptBuilder<
    */
   partial<TKeys extends keyof TInput>(
     values: Pick<TInput, TKeys>,
-  ): PromptBuilder<TInput, TPartialKeys | TKeys, TVersion>;
+  ): _PromptBuilder<TInput, TPartialKeys | TKeys, TVersion>;
 
   /** Attach arbitrary metadata persisted in the registry and serialized output. */
   metadata(meta: Readonly<Record<string, unknown>>): this;
@@ -323,19 +367,30 @@ export interface PromptBuilder<
   tags(...tags: string[]): this;
 
   /**
-   * Provide an optional runtime validator. Returning a non-empty `string[]`
-   * marks render as invalid and throws `VariableError` with the messages.
-   * Useful when bringing your own schema library (Zod / Valibot) without
-   * coupling this lib to one.
+   * Provide an optional runtime validator. Return an array of error messages
+   * (empty array `[]` means "valid") and a non-empty array throws
+   * `VariableError` with the messages joined.
+   *
+   * Note the explicit `readonly string[]` return — there is intentionally no
+   * `void` form. Forgetting `return errors` would silently treat any input as
+   * valid; requiring the array shape mirrors Zod / Valibot / Effect
+   * conventions and makes the contract impossible to forget.
    */
-  validate(fn: (vars: TInput) => string[] | void): this;
+  validate(fn: (vars: TInput) => readonly string[]): this;
 
   /**
    * Finalize the builder into an immutable `PromptDefinition`. After this
    * call the builder is frozen — further chaining throws `PromptError`.
    */
-  build(): PromptDefinition<Omit<TInput, TPartialKeys>, TVersion>;
-}
+  build(): PromptDefinition<Prettify<Omit<TInput, TPartialKeys>>, TVersion>;
+};
+
+/** Public single-arg alias surfaced in autocomplete. */
+export type PromptBuilder<TInput extends Record<string, unknown> = {}> =
+  _PromptBuilder<TInput, never, undefined>;
+
+/** Mapped-type identity that flattens intersection chains in editor hovers. */
+type Prettify<T> = { [K in keyof T]: T[K] } & {};
 ```
 
 The output `PromptDefinition`:
@@ -376,13 +431,14 @@ export interface RenderOptions {
 }
 ```
 
-### 2.2 The `block()` builder & `compose()`
+### 2.2 The `block()` builder, `tool()` builder, `compose()`
 
 ```ts
-import { block, compose } from '@aikit/prompts';
+import { block, tool, compose } from '@aikit/prompts';
 
 const system = block('system')
   .template('You are a helpful assistant. Persona: {{persona}}.')
+  .cacheBreakpoint()                     // anything above this point is a cache prefix
   .build();
 
 const examples = block('user')
@@ -394,7 +450,37 @@ const examples = block('user')
 
 const userTurn = block('user').template('{{question}}').build();
 
-const chat = compose([system, examples, userTurn]);
+// First-class tool / function definition (separate from `block('tool')` which
+// represents a tool *result* turn in the conversation).
+const searchTool = tool({
+  name: 'web_search',
+  description: 'Search the web and return the top results.',
+  parameters: {
+    type: 'object',
+    properties: {
+      query: { type: 'string' },
+      maxResults: { type: 'integer', default: 5 },
+    },
+    required: ['query'],
+  },
+});
+
+// Optional structured-output schema — adapters translate this into
+// OpenAI `response_format: { type: 'json_schema' }` / Anthropic structured
+// output / AI SDK `experimental_output: { schema }`.
+const responseSchema = {
+  type: 'object',
+  properties: {
+    answer: { type: 'string' },
+    confidence: { type: 'number' },
+  },
+  required: ['answer', 'confidence'],
+} as const;
+
+const chat = compose([system, examples, userTurn], {
+  tools: [searchTool],
+  responseSchema,
+});
 
 const messages = chat.render({
   persona: 'concise senior engineer',
@@ -422,14 +508,66 @@ export interface BlockBuilder<R extends Role, TInput> {
   template<T extends string>(body: T): BlockBuilder<R, InputShape<T>>;
   examples(pairs: ReadonlyArray<{ user: string; assistant: string }>): BlockBuilder<R, TInput>;
   partial<K extends keyof TInput>(vals: Pick<TInput, K>): BlockBuilder<R, Omit<TInput, K>>;
+
+  /**
+   * Mark a cache breakpoint at this point in the conversation. Adapters
+   * translate this into provider-specific cache hints:
+   *
+   *   - Anthropic: emits `cache_control: { type: 'ephemeral' }` on the
+   *     preceding content block (Anthropic prompt caching).
+   *   - OpenAI: marks the preceding prefix as the boundary of a `prompt_cache_key`
+   *     shared across requests with identical prefixes (OpenAI prompt caching).
+   *   - AI SDK / LangChain: passed through as `providerMetadata` for the underlying
+   *     adapter to honor.
+   *
+   * Up to 4 breakpoints per composition (Anthropic limit). Excess breakpoints
+   * collapse to the last 4 with a one-time warning.
+   */
+  cacheBreakpoint(): BlockBuilder<R, TInput>;
+
   build(): Block<R, TInput>;
 }
+
+/**
+ * Define a tool / function the LLM can call. Distinct from `block('tool')`,
+ * which represents a tool *result* turn in the conversation.
+ *
+ * `parameters` is a plain JSON Schema object. Bring-your-own validation:
+ * Zod (`zodToJsonSchema(schema)`), Valibot, Effect Schema, or
+ * hand-written JSON Schema all work — this lib is provider-agnostic and
+ * does not couple to a schema library.
+ */
+export function tool<TName extends string, TParams = unknown>(
+  def: ToolDefinition<TName, TParams>,
+): Tool<TName, TParams>;
+
+export interface ToolDefinition<TName extends string, TParams> {
+  readonly name: TName;
+  readonly description: string;
+  readonly parameters: JSONSchema;            // structural JSON Schema
+  /**
+   * Optional TypeScript type witness. If you pass a `parameters` JSON Schema
+   * generated from a Zod schema, you can supply the inferred type here so
+   * `Tool<TName, TParams>` carries the input type for downstream adapters.
+   */
+  readonly _typeWitness?: TParams;
+}
+
+export interface Tool<TName extends string, TParams> {
+  readonly name: TName;
+  readonly description: string;
+  readonly parameters: JSONSchema;
+  readonly _params?: TParams;                 // phantom — preserved for inference
+}
+
+export type JSONSchema = Readonly<Record<string, unknown>>; // structural
 
 /**
  * Compose blocks into a chat-style template.
  *
  * The returned `Composition` aggregates all variables across blocks, so
- * `.render()` requires the union of every block's inputs.
+ * `.render()` requires the union of every block's inputs. Optional
+ * `tools` / `responseSchema` / `cache` flow into adapter output.
  */
 export function compose<TBlocks extends ReadonlyArray<Block<Role, any>>>(
   blocks: TBlocks,
@@ -441,12 +579,24 @@ export interface ComposeOptions {
   readonly id?: string;
   /** Optional semver — composition itself can be versioned. */
   readonly version?: string;
+  /** Tool / function definitions adapters should expose to the model. */
+  readonly tools?: ReadonlyArray<Tool<string, unknown>>;
+  /** Structured-output JSON Schema adapters should attach (`response_format` / equivalent). */
+  readonly responseSchema?: JSONSchema;
+  /**
+   * Composition-level cache configuration. Controls whether `cacheBreakpoint()`
+   * marks emit provider hints. Default: `'auto'` (adapters decide based on the
+   * provider's caching support).
+   */
+  readonly cache?: 'auto' | 'off';
 }
 
 export interface Composition<TVars extends Record<string, unknown>> {
   readonly id?: string;
   readonly version?: string;
   readonly blocks: readonly Block<Role, unknown>[];
+  readonly tools: readonly Tool<string, unknown>[];
+  readonly responseSchema?: JSONSchema;
   render(vars: TVars, options?: RenderOptions): readonly ChatMessage[];
   /** Render to a single concatenated string (system + alternating turns joined). */
   renderText(vars: TVars, options?: RenderOptions): string;
@@ -460,32 +610,53 @@ export interface ChatMessage {
   readonly content: string | readonly MultimodalPart[];
   readonly name?: string;
   readonly toolCallId?: string;
+  /** Set when this message ends a `cacheBreakpoint()`-bounded prefix. */
+  readonly cacheControl?: 'ephemeral';
 }
 ```
 
 ### 2.3 Versioning & registry — `@aikit/prompts/versioning`
 
-```ts
-import { createRegistry } from '@aikit/prompts/versioning';
-import { greetV1, greetV2, greetV3Beta } from './prompts';
+The registry has **two creation paths**:
 
-const registry = createRegistry({
-  prompts: [greetV1, greetV2, greetV3Beta],
+1. **`createTypedRegistry(map)`** (preferred) — pass a record of `{ [id]: PromptDefinition }`. Lookups are typed end-to-end: `registry.get('greet.user')` returns the exact `PromptDefinition<TVars>` you registered, with `TVars` preserved.
+2. **`createRegistry(options)`** (escape hatch) — for dynamic / hot-reloaded prompts whose shape isn't statically known. Lookups return `PromptDefinition<Record<string, unknown>>` and the caller asserts the shape.
+
+```ts
+import { createTypedRegistry } from '@aikit/prompts/versioning';
+import { greetV1, greetV2, greetV3Beta, searchV1 } from './prompts';
+
+const registry = createTypedRegistry({
+  'greet.user':  [greetV1, greetV2, greetV3Beta],
+  'search.user': [searchV1],
 });
 
-const latestStable = registry.get('greet.user');           // → v2.0.0
-const explicit     = registry.get('greet.user', '1.0.0');   // → v1.0.0
-const range        = registry.get('greet.user', '^1.0.0');  // → v1.x latest
-const beta         = registry.get('greet.user', '3.0.0-beta'); // → v3.0.0-beta
+const latest = registry.get('greet.user');           // PromptDefinition<{ name: string; count: number }>
+//             ^? typed — TVars carried through from greetV1/V2/V3
+const v1     = registry.get('greet.user', '1.0.0');  // same TVars
+const search = registry.get('search.user');          // PromptDefinition<{ query: string }>
+const wrong  = registry.get('nope');                 // ❌ type error: '"nope"' is not assignable to known ids
 ```
 
 ```ts
 /**
- * Create an in-memory prompt registry indexed by `(id, version)`.
+ * Create a typed prompt registry from a static `{ id → PromptDefinition[] }`
+ * map. Lookups are typed end-to-end — `registry.get(id)` returns the precise
+ * `PromptDefinition<TVars>` shape that was registered for `id`, and unknown
+ * ids are caught at compile time.
  *
- * A registry is the single source of truth for which versions of which
- * prompts are available at runtime. It supports semver lookups and can be
- * fed by one or more `PromptSource`s for hot-reload behavior.
+ * Use this in application code where prompts are imported (the common case).
+ * Use `createRegistry()` for dynamic registries fed by hot-reload sources.
+ */
+export function createTypedRegistry<
+  const TMap extends Record<string, ReadonlyArray<PromptDefinition<any, any>>>,
+>(map: TMap, options?: RegistryOptions): TypedPromptRegistry<TMap>;
+
+/**
+ * Create a dynamic in-memory prompt registry indexed by `(id, version)`.
+ *
+ * Loose typing — `get()` returns `PromptDefinition<Record<string, unknown>>`.
+ * Prefer `createTypedRegistry()` for statically known prompts.
  */
 export function createRegistry(options?: RegistryOptions): PromptRegistry;
 
@@ -494,6 +665,29 @@ export interface RegistryOptions {
   readonly prompts?: ReadonlyArray<PromptDefinition>;
   /** Reject pre-release versions from `'latest'` resolution (default: true). */
   readonly excludePrereleaseFromLatest?: boolean;
+}
+
+export interface TypedPromptRegistry<
+  TMap extends Record<string, ReadonlyArray<PromptDefinition<any, any>>>,
+> {
+  /** Look up a prompt by id and an optional selector. Typed in `TMap`. */
+  get<K extends keyof TMap & string>(id: K, selector?: string): TMap[K][number];
+  /** Like `get`, but returns `undefined` if no version satisfies the selector. */
+  find<K extends keyof TMap & string>(id: K, selector?: string): TMap[K][number] | undefined;
+  /** All versions of `id` sorted descending. */
+  list<K extends keyof TMap & string>(id: K): TMap[K];
+  /** All registered prompt ids — narrowed to the keys of `TMap`. */
+  ids(): ReadonlyArray<keyof TMap & string>;
+  /** Add or replace a prompt at a specific (id, version). */
+  register(def: PromptDefinition): void;
+  /** Remove a specific (id, version). Returns true if anything was removed. */
+  unregister(id: string, version: string): boolean;
+  /** Attach a hot-reload source. Returns a synchronous unsubscribe function. */
+  addSource(source: PromptSource): () => void;
+  /** Subscribe to registry changes (added, replaced, removed). */
+  on(event: 'change', listener: (e: RegistryChangeEvent) => void): () => void;
+  /** Async cleanup of all attached sources. */
+  dispose(): Promise<void>;
 }
 
 export interface PromptRegistry {
@@ -506,38 +700,22 @@ export interface PromptRegistry {
    *   - `'^1.2.3'`, `'~1.2.3'`, `'>=1.2.3'`, `'1.x'`, `'*'` → semver range.
    *
    * @throws {VersionError} when no version satisfies the selector.
+   *
+   * NB: this loose form returns `PromptDefinition<Record<string, unknown>>`.
+   * Prefer `createTypedRegistry()` for static maps where the shape is known.
    */
-  get<TVars extends Record<string, unknown>>(
-    id: string,
-    selector?: string,
-  ): PromptDefinition<TVars>;
-
+  get(id: string, selector?: string): PromptDefinition;
   /** Same as `get`, but returns `undefined` instead of throwing. */
-  find<TVars extends Record<string, unknown>>(
-    id: string,
-    selector?: string,
-  ): PromptDefinition<TVars> | undefined;
-
-  /** All versions of `id` sorted descending. Empty array if unknown. */
+  find(id: string, selector?: string): PromptDefinition | undefined;
   list(id: string): readonly PromptDefinition[];
-
-  /** All registered prompt ids. */
   ids(): readonly string[];
-
-  /** Add or replace a prompt at a specific (id, version). */
   register(def: PromptDefinition): void;
-
-  /** Remove a specific (id, version). Returns true if anything was removed. */
   unregister(id: string, version: string): boolean;
-
-  /**
-   * Attach a hot-reload source. The registry will load() once immediately,
-   * then subscribe to change events. Returns an unsubscribe function.
-   */
-  addSource(source: PromptSource): () => Promise<void>;
-
-  /** Subscribe to registry changes (added, replaced, removed). */
+  /** Attach a hot-reload source. Returns a synchronous unsubscribe function. */
+  addSource(source: PromptSource): () => void;
   on(event: 'change', listener: (e: RegistryChangeEvent) => void): () => void;
+  /** Async cleanup of all attached sources (drains pending watchers, closes sockets). */
+  dispose(): Promise<void>;
 }
 ```
 
@@ -560,57 +738,88 @@ const search = createABTest({
 });
 
 const assignment = search.assign({ userId: 'user-42' });
-//   ^? Assignment<'control' | 'rephrased' | 'holdout'>
+//   ^? Assignment<'control' | 'rephrased', { query: string }>
 
-if (assignment.variant !== 'holdout') {
-  const text = assignment.prompt.render({ query: 'TypeScript generics' });
-  // …call your LLM…
+switch (assignment.kind) {
+  case 'variant': {
+    const text = assignment.prompt.render({ query: 'TypeScript generics' });
+    //                                       ^? typed — every variant in this test
+    //                                          is constrained to the same TVars
+    // …call your LLM…
+    break;
+  }
+  case 'holdout':
+    // user is excluded from the experiment — fall back to your control path
+    break;
+  case 'unassigned':
+    // identifier returned undefined / threw — fall back to your control path
+    break;
 }
 ```
 
 ```ts
 /**
  * Create a deterministic A/B (or A/B/C/...) split test over multiple
- * prompt variants.
+ * prompt variants. **All variants must share the same input shape `TVars`** —
+ * enforced at the type level so an A/B with mismatched required vars cannot
+ * compile. This is the worst class of A/B bug and is statically excluded.
  *
  * Assignment is computed client-side via FNV-1a hashing of the identifier,
  * so the same identifier always lands on the same variant — no network
  * round-trip, no shared store, edge-runtime safe.
  */
 export function createABTest<
-  const TVariants extends ReadonlyArray<VariantDefinition<string>>,
->(options: ABTestOptions<TVariants>): ABTest<TVariants[number]['id']>;
+  TVars extends Record<string, unknown>,
+  const TVariants extends ReadonlyArray<VariantDefinition<string, TVars>>,
+>(options: ABTestOptions<TVars, TVariants>): ABTest<TVars, TVariants[number]['id']>;
 
-export interface ABTestOptions<TVariants extends ReadonlyArray<VariantDefinition<string>>> {
+export interface ABTestOptions<
+  TVars extends Record<string, unknown>,
+  TVariants extends ReadonlyArray<VariantDefinition<string, TVars>>,
+> {
   /** Stable name; mixed into the hash so two tests with identical ids segment independently. */
   readonly name: string;
-  /** Variant definitions. Weights must sum to <= 100. */
+  /** Variant definitions. Weights must sum to <= 100. All variants share `TVars`. */
   readonly variants: TVariants;
   /** Pure function returning a string used to bucket the user. */
   readonly identifier: (ctx: AssignmentContext) => string | undefined;
-  /** Fraction of users excluded from the test entirely (returned as `'holdout'`). */
+  /** Fraction of users excluded from the test entirely (returned as `kind: 'holdout'`). */
   readonly holdout?: number;
   /** Optional override for the hash function (default: FNV-1a 32). */
   readonly hash?: (input: string) => number;
 }
 
-export interface VariantDefinition<TId extends string> {
+export interface VariantDefinition<
+  TId extends string,
+  TVars extends Record<string, unknown>,
+> {
   readonly id: TId;
-  readonly prompt: PromptDefinition;
+  readonly prompt: PromptDefinition<TVars>;
   readonly weight: number; // 0 < weight <= 100
 }
 
-export interface ABTest<TVariantId extends string> {
+export interface ABTest<
+  TVars extends Record<string, unknown>,
+  TVariantId extends string,
+> {
   readonly name: string;
-  assign(ctx: AssignmentContext): Assignment<TVariantId>;
+  assign(ctx: AssignmentContext): Assignment<TVariantId, TVars>;
   /** Pure preview helper: returns the deterministic bucket [0,1) for the identifier. */
   bucket(ctx: AssignmentContext): number;
 }
 
-export type Assignment<TVariantId extends string> =
-  | { readonly variant: TVariantId; readonly prompt: PromptDefinition; readonly bucket: number }
-  | { readonly variant: 'holdout'; readonly prompt: undefined;        readonly bucket: number }
-  | { readonly variant: 'unassigned'; readonly prompt: undefined;     readonly bucket: -1 };
+/**
+ * Discriminated on `kind`, NOT on `variant`, so that user-chosen variant ids
+ * (including `'holdout'` or `'unassigned'`) cannot collide with the special
+ * cases. Switch on `assignment.kind` for exhaustive narrowing.
+ */
+export type Assignment<
+  TVariantId extends string,
+  TVars extends Record<string, unknown>,
+> =
+  | { readonly kind: 'variant';    readonly id: TVariantId; readonly prompt: PromptDefinition<TVars>; readonly bucket: number }
+  | { readonly kind: 'holdout';    readonly bucket: number }
+  | { readonly kind: 'unassigned'; readonly bucket: -1; readonly reason: 'no-identifier' | 'identifier-threw'; readonly cause?: unknown };
 
 export interface AssignmentContext {
   readonly userId?: string;
@@ -619,19 +828,46 @@ export interface AssignmentContext {
 }
 ```
 
-### 2.5 Cost tracking — `@aikit/prompts/cost`
+### 2.5 Cost estimation — `@aikit/prompts/cost`
+
+> **Honesty about the heuristic.** The default tokenizer is `Math.ceil(text.length / 4)` —
+> roughly correct for English, ~10% under for Latin scripts, and up to ~50% over for
+> CJK. That is **fine for ballparking** ("which prompt version is roughly cheaper")
+> and **wrong for billing-grade accounting**. Use the optional `@aikit/prompts/cost/tiktoken`
+> subpath for production-accurate counts.
+>
+> The API names reflect this: `estimateCost()` and `estimateTokens()`. Callers who
+> want a clear "this is a rough number" signal at the call site can use the
+> `roughCost()` alias re-exported from `@aikit/prompts/cost`.
 
 ```ts
-import { estimateCost, registerModel } from '@aikit/prompts/cost';
+import { estimateCost, estimateTokens, registerModel } from '@aikit/prompts/cost';
+import { tiktokenFor } from '@aikit/prompts/cost/tiktoken'; // optional, peer-deps `js-tiktoken`
 import { greet } from './prompts';
 
-const c = estimateCost({
+// Heuristic (default — rough, no extra deps)
+const rough = estimateCost({
   prompt: greet,
   vars: { name: 'Alice', count: 3 },
   model: 'gpt-4o',
   expectedOutputTokens: 200,
 });
-// c: { inputTokens: 12, outputTokens: 200, inputCostUSD: 0.00006, outputCostUSD: 0.003, totalUSD: 0.00306, currency: 'USD', pricingDate: '2026-04-27' }
+// rough: { inputTokens: 12, outputTokens: 200, inputCostUSD: 0.00006, outputCostUSD: 0.003,
+//          totalUSD: 0.00306, currency: 'USD', pricingDate: '2026-04-27',
+//          tokenizer: 'heuristic-4cpt', accuracy: 'rough' }
+
+// Production-accurate (opt-in)
+const accurate = estimateCost({
+  prompt: greet,
+  vars: { name: 'Alice', count: 3 },
+  model: 'gpt-4o',
+  expectedOutputTokens: 200,
+  tokenizer: tiktokenFor('gpt-4o'),
+});
+// accurate.tokenizer === 'tiktoken/cl100k_base', accurate.accuracy === 'exact'
+
+// Token counts only (no pricing required)
+const t = estimateTokens({ prompt: greet, vars: { name: 'A', count: 1 } });
 
 // Custom / private model:
 registerModel('internal-llama-70b', {
@@ -644,18 +880,36 @@ registerModel('internal-llama-70b', {
 /**
  * Estimate input/output token counts and dollar cost for a (prompt, vars, model) tuple.
  *
- * @param expectedOutputTokens Optional. Defaults to 0 (input cost only). Pass an
- *   estimate (e.g. your max_tokens setting) to include output cost.
- * @param tokenizer Optional. Defaults to a 4 chars/token heuristic.
- *   Provide a real tokenizer (tiktoken adapter) for production accuracy.
+ * Generic in `TVars` so the `vars` argument is type-checked against the
+ * prompt's input shape — no `Record<string, unknown>` widening.
+ *
+ * @param expectedOutputTokens Optional. Defaults to 0 (input cost only).
+ * @param tokenizer Optional. Defaults to a 4 chars/token heuristic. Pass
+ *   `tiktokenFor(model)` from `@aikit/prompts/cost/tiktoken` for accurate counts.
  */
-export function estimateCost(args: EstimateCostArgs): CostEstimate;
+export function estimateCost<TVars extends Record<string, unknown>>(
+  args: EstimateCostArgs<TVars>,
+): CostEstimate;
 
-export interface EstimateCostArgs {
-  readonly prompt: PromptDefinition | Composition<any>;
-  readonly vars: Record<string, unknown>;
+/** Alias of `estimateCost` — name signals to the call site that the result is a heuristic. */
+export const roughCost: typeof estimateCost;
+
+/** Tokens-only counterpart. Same generic, no pricing/model required. */
+export function estimateTokens<TVars extends Record<string, unknown>>(
+  args: EstimateTokensArgs<TVars>,
+): TokenEstimate;
+
+export interface EstimateCostArgs<TVars extends Record<string, unknown>> {
+  readonly prompt: PromptDefinition<TVars> | Composition<TVars>;
+  readonly vars: TVars;
   readonly model: string;
   readonly expectedOutputTokens?: number;
+  readonly tokenizer?: TokenizerFn;
+}
+
+export interface EstimateTokensArgs<TVars extends Record<string, unknown>> {
+  readonly prompt: PromptDefinition<TVars> | Composition<TVars>;
+  readonly vars: TVars;
   readonly tokenizer?: TokenizerFn;
 }
 
@@ -668,9 +922,20 @@ export interface CostEstimate {
   readonly currency: 'USD';
   readonly model: string;
   readonly pricingDate: string;
+  readonly tokenizer: string;        // identifier ('heuristic-4cpt', 'tiktoken/cl100k_base', …)
+  readonly accuracy: 'rough' | 'exact';
 }
 
-export type TokenizerFn = (text: string, model: string) => number;
+export interface TokenEstimate {
+  readonly inputTokens: number;
+  readonly tokenizer: string;
+  readonly accuracy: 'rough' | 'exact';
+}
+
+export type TokenizerFn = ((text: string, model: string) => number) & {
+  readonly id?: string;
+  readonly accuracy?: 'rough' | 'exact';
+};
 
 /** Add or override pricing for a model. */
 export function registerModel(model: string, pricing: ModelPricing): void;
@@ -680,33 +945,63 @@ export function listModels(): readonly string[];
 export interface ModelPricing {
   readonly inputUSDPer1M: number;
   readonly outputUSDPer1M: number;
+  /** Optional: per-1M token price for cached input under prompt-caching. */
+  readonly cachedInputUSDPer1M?: number;
 }
 ```
 
-### 2.6 Sources — `@aikit/prompts/sources/*`
+```ts
+// @aikit/prompts/cost/tiktoken — opt-in subpath, peer-optional `js-tiktoken`.
+export function tiktokenFor(model: string): TokenizerFn;
+```
+
+### 2.6 Sources — `@aikit/prompts/sources*`
+
+> **Layout note.** `memorySource` is exported from the universal `@aikit/prompts/sources`
+> barrel — it is too small (~200 B minified) to justify a dedicated subpath. Edge-safe
+> network sources live at `@aikit/prompts/sources/http`. Node-only filesystem sources
+> live at `@aikit/prompts/sources/fs` (lazy-loaded behind `await import('node:fs/promises')`).
+>
+> **Trust boundary.** Hot-reloading prompts from a URL is effectively remote
+> code execution into the LLM context. TLS protects the wire, but the KV/CDN
+> provider itself is in the threat model. `httpSource` accepts a `verify`
+> callback for HMAC / Ed25519 / Sigstore verification, and ships a built-in
+> `verifyHmac()` helper using Web Crypto (universal across edge runtimes).
 
 ```ts
 import { createRegistry } from '@aikit/prompts/versioning';
+import { memorySource, verifyHmac } from '@aikit/prompts/sources';
 import { httpSource } from '@aikit/prompts/sources/http';
 import { fsSource } from '@aikit/prompts/sources/fs';
 
 const registry = createRegistry();
 
-await registry.addSource(
+const unsubHttp = registry.addSource(
   httpSource({
     url: 'https://kv.example.com/prompts.json',
     ttlMs: 60_000,
     headers: { authorization: `Bearer ${env.PROMPT_TOKEN}` },
+    verify: verifyHmac({
+      secret: env.PROMPT_SIGNING_SECRET,
+      headerName: 'x-prompt-signature',
+      algorithm: 'SHA-256',
+    }),
   }),
 );
 
 // Node-only example:
-await registry.addSource(
+const unsubFs = registry.addSource(
   fsSource({
     glob: './prompts/**/*.json',
     watch: true,                 // hot reload on file change
   }),
 );
+
+// React-style cleanup is sync — no `void promise` dance:
+useEffect(() => unsubHttp, []);
+
+// When tearing down the registry:
+await registry.dispose();        // drains async cleanup of all sources
 ```
 
 ```ts
@@ -717,15 +1012,23 @@ export interface PromptSource {
   /**
    * Optional subscription. If provided, the registry will call it once per
    * source and forward each emission to its `change` listeners.
+   *
+   * The returned unsubscribe is **synchronous** — React `useEffect` cleanup,
+   * `finally` blocks, and signal handlers can call it directly. If a source
+   * needs to flush async I/O during teardown, expose `dispose()` separately.
    */
-  subscribe?(listener: (event: SourceChangeEvent) => void): () => Promise<void>;
+  subscribe?(listener: (event: SourceChangeEvent) => void): () => void;
+  /** Optional async cleanup invoked by `registry.dispose()`. */
+  dispose?(): Promise<void>;
 }
 
 export type SourceChangeEvent =
   | { type: 'added';    prompt: PromptDefinitionJson }
   | { type: 'replaced'; prompt: PromptDefinitionJson }
-  | { type: 'removed';  id: string; version: string };
+  | { type: 'removed';  id: string; version: string }
+  | { type: 'error';    error: SourceError };
 
+/** Inlined into the universal `@aikit/prompts/sources` barrel — no subpath. */
 export function memorySource(records: readonly PromptDefinitionJson[]): PromptSource;
 
 export function httpSource(options: HttpSourceOptions): PromptSource;
@@ -735,7 +1038,28 @@ export interface HttpSourceOptions {
   readonly headers?: HeadersInit;
   readonly ttlMs?: number;
   readonly parser?: (raw: unknown) => readonly PromptDefinitionJson[];
+  /**
+   * Integrity check applied to every successful fetch. Return `false` (or a
+   * rejected promise) to reject the body — the source emits a `change` event
+   * of `type: 'error'` with `code: SOURCE_INTEGRITY_FAILED` and the previous
+   * load remains in effect.
+   */
+  readonly verify?: VerifyFn;
 }
+
+export type VerifyFn = (body: string, response: Response) => boolean | Promise<boolean>;
+
+/**
+ * Built-in HMAC verifier. Uses Web Crypto (`SubtleCrypto`) so it works in
+ * Node 18+, Bun, Deno, browsers, Vercel Edge, and Cloudflare Workers without
+ * pulling `node:crypto`.
+ */
+export function verifyHmac(options: {
+  readonly secret: string | ArrayBuffer | CryptoKey;
+  readonly headerName: string;                    // e.g. 'x-prompt-signature'
+  readonly algorithm?: 'SHA-256' | 'SHA-384' | 'SHA-512';   // default 'SHA-256'
+  readonly encoding?: 'hex' | 'base64' | 'base64url';        // default 'hex'
+}): VerifyFn;
 
 export function fsSource(options: FsSourceOptions): PromptSource;
 export interface FsSourceOptions {
@@ -759,28 +1083,59 @@ const completion = await new OpenAI().chat.completions.create({
 ```
 
 ```ts
-export function toOpenAI(
-  src: PromptDefinition | Composition<any>,
-  vars: Record<string, unknown>,
-): { messages: OpenAIChatMessage[] };
+/**
+ * All adapters are generic in the prompt's input shape `TVars`. The `vars`
+ * argument is type-checked against the prompt definition — no
+ * `Record<string, unknown>` widening at the adapter boundary.
+ *
+ * Adapters carry through tool definitions (`composition.tools`),
+ * structured-output schemas (`composition.responseSchema`), and cache
+ * breakpoints (`block.cacheBreakpoint()`) into provider-specific shapes.
+ */
+export function toOpenAI<TVars extends Record<string, unknown>>(
+  src: PromptDefinition<TVars> | Composition<TVars>,
+  vars: TVars,
+): {
+  messages: OpenAIChatMessage[];
+  tools?: OpenAIToolParam[];                   // emitted when composition.tools is non-empty
+  response_format?: OpenAIResponseFormat;      // emitted when composition.responseSchema is set
+  prompt_cache_key?: string;                   // hash of the cache-prefix when cacheBreakpoint() is used
+};
 
-export function toAnthropic(
-  src: PromptDefinition | Composition<any>,
-  vars: Record<string, unknown>,
-): { system?: string; messages: AnthropicMessage[] };
+export function toAnthropic<TVars extends Record<string, unknown>>(
+  src: PromptDefinition<TVars> | Composition<TVars>,
+  vars: TVars,
+): {
+  system?: string | AnthropicTextBlock[];      // arrays carry per-block cache_control
+  messages: AnthropicMessage[];                // content blocks may carry cache_control: { type: 'ephemeral' }
+  tools?: AnthropicToolParam[];
+  // Anthropic structured output: passed via tool_choice forced-call pattern when responseSchema set.
+};
 
-export function toAISDK(
-  src: PromptDefinition | Composition<any>,
-  vars: Record<string, unknown>,
-): { messages: AISDKCoreMessage[] };
+export function toAISDK<TVars extends Record<string, unknown>>(
+  src: PromptDefinition<TVars> | Composition<TVars>,
+  vars: TVars,
+): {
+  messages: AISDKCoreMessage[];
+  tools?: Record<string, AISDKToolDef>;
+  experimental_output?: { schema: JSONSchema };
+  providerOptions?: Record<string, unknown>;   // includes cache hints
+};
 
-export function toLangChain(
-  src: PromptDefinition | Composition<any>,
-  vars: Record<string, unknown>,
+export function toLangChain<TVars extends Record<string, unknown>>(
+  src: PromptDefinition<TVars> | Composition<TVars>,
+  vars: TVars,
 ): BaseMessage[];
 ```
 
 Adapters import provider types **only** via `import type`, so the adapters work without the SDK installed at runtime — they just shape data.
+
+> **MCP (Model Context Protocol) — v0.2 milestone.** A `toMCP()` adapter that
+> emits the MCP prompt-template envelope (`prompts/get` response shape with
+> typed `arguments` derived from `TVars`) is planned for the v0.2 release. Not
+> v0.1: the MCP spec is still consolidating in 2026 and we want to ship
+> against the stabilized 1.x prompt resource shape rather than chase the
+> draft. Tracked in §11.
 
 ### 2.8 Result helper for predictable failures
 
@@ -1063,8 +1418,11 @@ export type ErrorCode =
   | 'SOURCE_LOAD_FAILED'
   | 'SOURCE_PARSE_FAILED'
   | 'SOURCE_FS_UNAVAILABLE'
+  | 'SOURCE_INTEGRITY_FAILED'
   | 'REGISTRY_DUPLICATE'
-  | 'BUILDER_FROZEN';
+  | 'BUILDER_FROZEN'
+  | 'TOOL_INVALID_SCHEMA'
+  | 'CACHE_BREAKPOINT_LIMIT';
 
 export abstract class PromptError extends Error {
   abstract readonly code: ErrorCode;
@@ -1113,7 +1471,14 @@ Every thrown error includes:
 1. The human-readable message.
 2. The `code` (for programmatic handling).
 3. Structural context (missing keys, the offending version string, the source name).
-4. A docs-link suffix in dev only: `npm config get loglevel` → if `info`/`verbose`, append `(see https://github.com/j09822475-dev/aikit-prompts/blob/main/docs/errors.md#code)`. Production builds (`process.env.NODE_ENV === 'production'`) suppress the suffix to avoid noise.
+4. A docs-link suffix appended unless `NODE_ENV === 'production'` (e.g. `(see https://github.com/j09822475-dev/aikit-prompts/blob/main/docs/errors.md#variable_missing)`). The check is **edge-safe**:
+   ```ts
+   const isProd =
+     typeof process !== 'undefined' &&
+     typeof process.env !== 'undefined' &&
+     process.env.NODE_ENV === 'production';
+   ```
+   No `npm config` invocation (that is a build-time CLI, not a runtime API), no bare `process.env` access (Cloudflare Workers and Vercel Edge throw `ReferenceError` on undefined `process`). When in doubt, including the docs link is the safer default — the noise is worth it for debugging.
 
 ### 5.4 Strictness toggles
 
@@ -1125,22 +1490,35 @@ Every thrown error includes:
 
 ### 6.1 Entry points (`package.json#exports`)
 
-| Subpath | Files included | Size budget |
+> All sizes are **minified + gzip** as measured by `size-limit` with
+> `@size-limit/preset-small-lib` (its default). The preset reports gzip;
+> stating "min" alone would be misleading. CI fails the build on any cap breach.
+
+| Subpath | Files included | Size budget (min+gz) |
 |---|---|---|
-| `.` | `core/*`, `types/*`, `internal/*`, `errors/base` | **9 KB** (target), 12 KB (hard cap) |
+| `.` | `core/*` (without iteration directives), `types/*`, `internal/*`, `errors/base` | **7 KB** target, 9 KB hard cap |
+| `./template-extras` | `{{#if}}`, `{{#each}}`, `{{> partial}}` parser extension | 2 KB |
 | `./errors` | All concrete error classes | 0.6 KB |
 | `./versioning` | `versioning/*`, depends on `.` | 1.5 KB |
 | `./testing` | `testing/*`, depends on `.` | 1 KB |
-| `./cost` | `cost/*`, depends on `.` | 2 KB (most weight is the pricing table) |
-| `./sources` | barrel (universal sources only) | 0.3 KB |
+| `./cost` | `cost/*` (heuristic only), depends on `.` | 2 KB (most weight is the pricing table) |
+| `./cost/tiktoken` | Lazy `js-tiktoken` adapter (peer-optional) | 0.4 KB (the wrapper; `js-tiktoken` itself is a peer) |
+| `./sources` | Universal barrel: `memorySource`, `verifyHmac` | 0.6 KB |
+| `./sources/http` | Edge-safe http source with `verify` hook | 0.9 KB |
 | `./sources/fs` | Node-only fs source | 1 KB |
-| `./sources/http` | Edge-safe http source | 0.8 KB |
-| `./sources/memory` | Memory source | 0.2 KB |
-| `./adapters/openai` | OpenAI shaping | 0.6 KB |
-| `./adapters/anthropic` | Anthropic shaping | 0.6 KB |
-| `./adapters/ai-sdk` | Vercel AI SDK shaping | 0.6 KB |
+| `./adapters/openai` | OpenAI shaping (msgs + tools + response_format + cache key) | 0.8 KB |
+| `./adapters/anthropic` | Anthropic shaping (msgs + tools + cache_control) | 0.8 KB |
+| `./adapters/ai-sdk` | Vercel AI SDK shaping | 0.7 KB |
 | `./adapters/langchain` | LangChain compat | 0.6 KB |
 | `./package.json` | (resolution support) | — |
+
+> **Why the budget changed.** Vasyl correctly flagged that 9 KB *minified* (the
+> previous wording) for a parser supporting iteration directives, partials,
+> compose-time variable union, deep-equal, freeze plumbing, and the `Result`
+> helpers was unrealistic. Resolution: (a) state caps as min+gz to match
+> `size-limit`'s default, (b) move iteration to `template-extras` so the core
+> parser stays substitution-only, (c) carve out `cost/tiktoken` so `js-tiktoken`
+> never lands in core. Result: a credible 7 KB min+gz core.
 
 ### 6.2 Tree-shaking guarantees
 
@@ -1159,19 +1537,20 @@ Every thrown error includes:
 // tsup.config.ts (sketch — written during implementation)
 export default defineConfig({
   entry: {
-    index:                 'src/index.ts',
-    'errors/index':        'src/errors/index.ts',
-    'versioning/index':    'src/versioning/index.ts',
-    'testing/index':       'src/testing/index.ts',
-    'cost/index':          'src/cost/index.ts',
-    'sources/index':       'src/sources/index.ts',
-    'sources/memory':      'src/sources/memory.ts',
-    'sources/http':        'src/sources/http.ts',
-    'sources/fs':          'src/sources/fs.ts',
-    'adapters/openai/index':    'src/adapters/openai/index.ts',
-    'adapters/anthropic/index': 'src/adapters/anthropic/index.ts',
-    'adapters/ai-sdk/index':    'src/adapters/ai-sdk/index.ts',
-    'adapters/langchain/index': 'src/adapters/langchain/index.ts',
+    index:                       'src/index.ts',
+    'template-extras/index':     'src/template-extras/index.ts',
+    'errors/index':              'src/errors/index.ts',
+    'versioning/index':          'src/versioning/index.ts',
+    'testing/index':             'src/testing/index.ts',
+    'cost/index':                'src/cost/index.ts',
+    'cost/tiktoken':             'src/cost/tiktoken.ts',
+    'sources/index':             'src/sources/index.ts',
+    'sources/http':              'src/sources/http.ts',
+    'sources/fs':                'src/sources/fs.ts',
+    'adapters/openai/index':     'src/adapters/openai/index.ts',
+    'adapters/anthropic/index':  'src/adapters/anthropic/index.ts',
+    'adapters/ai-sdk/index':     'src/adapters/ai-sdk/index.ts',
+    'adapters/langchain/index':  'src/adapters/langchain/index.ts',
   },
   format: ['esm'],
   dts: true,
@@ -1181,7 +1560,11 @@ export default defineConfig({
   treeshake: true,
   splitting: false,        // each subpath is its own bundle
   target: 'es2022',
-  external: ['ai', 'openai', '@anthropic-ai/sdk', '@langchain/core', 'node:fs/promises', 'node:fs'],
+  external: [
+    'ai', 'openai', '@anthropic-ai/sdk', '@langchain/core',
+    'js-tiktoken',                          // peer-optional, only loaded by cost/tiktoken
+    'node:fs/promises', 'node:fs',
+  ],
 });
 ```
 
@@ -1375,6 +1758,29 @@ Standard set for the portfolio: `tsup`, `typescript`, `vitest`, `@vitest/coverag
 58. `toAISDK` with multimodal parts — preserved; falls back to text-only if the part type is unknown.
 59. `toLangChain` with `@langchain/core` not installed — adapter still works at runtime (it produces plain objects matching the `BaseMessage` shape); type-check requires the peer dep.
 
+### 9.8 Tools, structured outputs, prompt caching
+65. `tool({ parameters })` with a non-object schema → `TOOL_INVALID_SCHEMA` at call time (the JSON Schema must have `type: 'object'` for OpenAI/Anthropic compatibility).
+66. Two `tool()` definitions with the same `name` in the same `compose({ tools })` → `TOOL_INVALID_SCHEMA` (duplicate tool names are a provider error; we surface it earlier).
+67. `responseSchema` declared on a composition that also declares `tools` with a forced `tool_choice` — adapters prioritize structured output over forced tool calls and emit a one-time warning.
+68. `cacheBreakpoint()` called more than 4 times in a single composition → keep the last 4, emit `CACHE_BREAKPOINT_LIMIT` warning (Anthropic hard limit; OpenAI ignores breakpoint count).
+69. `cacheBreakpoint()` on a `Composition` rendered for `toLangChain` — pass-through via `additional_kwargs.providerMetadata`; LangChain core itself does not consume it.
+70. `compose({ cache: 'off' })` — adapters strip all `cache_control` markers and `prompt_cache_key` fields, useful for A/B-comparing cache-enabled vs cache-disabled.
+
+### 9.9 Source integrity
+71. `httpSource({ verify })` returns `false` → emit `change` event `{ type: 'error', error: SourceError(SOURCE_INTEGRITY_FAILED) }`; the previous successful load remains active.
+72. `verifyHmac` with header missing on the response → returns `false`, surfaces as `SOURCE_INTEGRITY_FAILED`.
+73. `verifyHmac` with `secret` rotated mid-flight (cluster scenario) — supply an array of secrets and accept if any matches; documented pattern in `verifyHmac` JSDoc.
+74. Unsubscribe returned by `addSource()` called twice → second call is a no-op (idempotent), no error.
+75. `registry.dispose()` called while a source's `load()` is in flight → awaits the in-flight load, then runs each source's `dispose()` in parallel.
+
+### 9.10 Cost / tokenizer accuracy
+76. `tokenizer` returns `0` for non-empty input → still valid (treated as "below resolution"); cost is 0 for that segment.
+77. `estimateCost` for a model whose pricing has `cachedInputUSDPer1M` set, called on a composition with `cacheBreakpoint()` — the heuristic does NOT auto-discount (it cannot know the cache hit rate); document that callers pass an explicit `cachedTokens` override (added in v0.2). v0.1 always assumes cold-cache pricing — documented as a known under-precision.
+78. `tiktokenFor('unknown-model')` falls back to `cl100k_base` with a one-time `console.warn` and tags the result `tokenizer: 'tiktoken/cl100k_base (fallback)'`.
+
+### 9.11 Type-shape A/B safety
+79. `createABTest({ variants: [{ prompt: greetV1 }, { prompt: searchV1 }] })` — `greetV1` and `searchV1` have divergent `TVars` → **compile error** (the array constraint forces a single `TVars` across all variants). This is the headline class of bug the new typing prevents.
+
 ### 9.8 Misc
 60. Calling builder methods after `.build()` → `BUILDER_FROZEN`.
 61. `Object.freeze` of nested partial values is shallow; document that consumers should not mutate nested objects passed to `.partial()`.
@@ -1399,13 +1805,108 @@ Pinned here so future contributors don't drift the scope:
 
 ## 11. Implementation Order (non-binding)
 
-1. `internal/parser` + `core/template` + `core/types` + `errors/*` — the rendering core, fully tested.
-2. `types/extract-vars` + `types/input-shape` + `types/test-d.ts` files — type system locked in.
-3. `core/prompt` + `core/block` + `core/compose` builders.
-4. `versioning/semver` + `versioning/registry` + `versioning/selector`.
-5. `testing/hash` + `testing/allocation` + `testing/ab-test`.
-6. `cost/tokenizer` + `cost/pricing` + `cost/estimate`.
-7. `sources/memory` + `sources/http` + `sources/fs`.
-8. `adapters/openai` + `adapters/anthropic` + `adapters/ai-sdk` + `adapters/langchain`.
-9. README, examples, benchmarks.
-10. CI: `lint → typecheck → test → coverage → build → publint → attw → size`.
+### v0.1 — first publishable cut
+
+1. `internal/parser` (substitution-only) + `core/template` + `core/types` + `errors/*` — the rendering core, fully tested.
+2. `types/extract-vars` + `types/input-shape` + `types/test-d.ts` files — type system locked in (including the A/B "all variants share TVars" assertion).
+3. `core/prompt` (with `.input<T>()` intersect + `.replaceInput<T>()`) + `core/block` (with `.cacheBreakpoint()`) + `core/tool` + `core/compose` builders.
+4. `versioning/semver` + `versioning/registry` + `versioning/selector`. Both `createTypedRegistry` and `createRegistry` shipping together.
+5. `testing/hash` + `testing/allocation` + `testing/ab-test` with the `kind`-discriminated `Assignment`.
+6. `cost/tokenizer` + `cost/pricing` (with `cachedInputUSDPer1M`) + `cost/estimate`.
+7. `sources/memory` (inlined into the universal barrel) + `sources/verify` (`verifyHmac`) + `sources/http` (with `verify` hook) + `sources/fs`.
+8. `adapters/openai` + `adapters/anthropic` + `adapters/ai-sdk` + `adapters/langchain` — all generic in `TVars`, all carry tools / responseSchema / cache breakpoints.
+9. `template-extras` (`{{#if}}`, `{{#each}}`, `{{> partial}}`) as opt-in subpath.
+10. `cost/tiktoken` peer-optional subpath (`tiktokenFor`).
+11. README, examples (incl. one demonstrating Anthropic prompt caching end-to-end), benchmarks.
+12. CI: `lint → typecheck → test → coverage → build → publint → attw → size`.
+
+### v0.2 milestones (post-launch backlog)
+
+- **`toMCP()` adapter** — emit MCP `prompts/get` envelopes with typed `arguments` derived from `TVars`. Ship against the stabilized 1.x prompt resource shape.
+- **Cache-aware cost estimation** — `estimateCost({ cachedTokens })` to model the Anthropic / OpenAI cached-input discount when callers know their cache hit rate.
+- **`toPromptfoo()` helper** — emit a `promptfoo` config snippet for an A/B test definition so users can drive eval/regression suites from the same registry.
+- **Native Web Crypto Ed25519 verifier** — sibling to `verifyHmac` once Web Crypto Ed25519 support stabilizes across edge runtimes (Cloudflare Workers, Vercel Edge, Bun, Deno).
+- **Streaming-aware adapters** — pass-through `experimental_partialOutput` schema and tool-call streaming hints once Vercel AI SDK 4.x stabilizes the shape.
+
+---
+
+## Review Changes
+
+This section records the disposition of every reviewer point from PR #1 (Vasyl Bruhanda, REQUEST_CHANGES). Each entry: the original concern, the resolution, and the PLAN.md / package.json sections that moved.
+
+### Critical
+
+**1. Type information dies on registry retrieval, adapter call, and cost estimation.** *Agreed — this was the headline ship-blocker.* The whole pitch falls apart if the typed prompt becomes `Record<string, unknown>` at the registry boundary.
+- **Registry**: added `createTypedRegistry<TMap>(map)` factory that preserves per-id `TVars` end-to-end (`registry.get('greet.user')` is the precise `PromptDefinition<{ name: string; count: number }>`). Kept `createRegistry()` as the loose escape hatch for dynamic / hot-reloaded prompts. Updated §2.3 in full.
+- **Adapters**: `toOpenAI`, `toAnthropic`, `toAISDK`, `toLangChain` are now `<TVars>(src: PromptDefinition<TVars> | Composition<TVars>, vars: TVars)`. §2.7 rewritten.
+- **Cost**: `estimateCost<TVars>(args: EstimateCostArgs<TVars>)` — `vars` is type-checked against the prompt. §2.5 rewritten.
+- **Sections changed**: §2.3, §2.5, §2.7, §1 file-by-file table.
+
+**2. A/B variants don't enforce identical input shape.** *Agreed — the worst class of A/B bug, and it ships green.*
+- `createABTest` is now `<TVars, const TVariants extends ReadonlyArray<VariantDefinition<string, TVars>>>(...)` — every variant is constrained to the same `TVars`.
+- `VariantDefinition<TId, TVars>` parameterized; `prompt: PromptDefinition<TVars>`.
+- `Assignment` now discriminates on `kind: 'variant' | 'holdout' | 'unassigned'` rather than overloading `variant`, so a user-named `'holdout'` variant cannot collapse the union (addresses Vasyl's medium issue #9 in the same change).
+- Added edge case 79 in §9.11 calling out that mismatched-`TVars` variants are now a compile error.
+- **Sections changed**: §2.4, §9.11.
+
+### High
+
+**3. `process.env.NODE_ENV` and `npm config get loglevel` break Edge runtimes.** *Agreed — Vasyl is right that `npm config` at runtime is nonsense and bare `process.env` throws on Workers.*
+- §5.3 rewritten: dropped the `npm config` line entirely; the env check is gated `typeof process !== 'undefined' && typeof process.env !== 'undefined' && process.env.NODE_ENV === 'production'`. Documented "include the link by default" as the safer fallback.
+- **Sections changed**: §5.3.
+
+**4. 9 KB minified core budget is aspirational given declared parser surface.** *Agreed.* I took the more conservative path Vasyl offered: move iteration directives out of core *and* clarify min+gz.
+- Iteration directives (`{{#if}}`, `{{#each}}`, `{{> partial}}`) moved to a new opt-in `@aikit/prompts/template-extras` subpath. Core parser is now substitution-only (the 80% case).
+- All size-limit budgets restated as **min+gz** (matching `@size-limit/preset-small-lib`'s default). Core target lowered to 7 KB min+gz with a 9 KB hard cap; `template-extras` carries 2 KB.
+- Added an explicit "Why the budget changed" callout under the §6.1 table.
+- **Sections changed**: §0 principle 10, §1 file structure, §1 file-by-file table (`internal/parser`), §6.1, §6.3 tsup entries, package.json `size-limit` (gzip flag set, all entries renamed `(min+gz)`).
+
+**5. No first-class story for prompt caching, tool defs, structured outputs, MCP.** *Agreed — the report itself flags caching as a competitive risk.*
+- Added `block().cacheBreakpoint()` chain step. Adapters translate to Anthropic `cache_control: { type: 'ephemeral' }`, OpenAI `prompt_cache_key`, and AI SDK `providerOptions`. Up to 4 breakpoints per composition (Anthropic limit) with `CACHE_BREAKPOINT_LIMIT` warning above that.
+- Added `tool({ name, description, parameters })` builder distinct from `block('tool')`. Plain JSON Schema parameters; bring-your-own validation (Zod, Valibot, Effect).
+- Added `compose({ tools?, responseSchema?, cache? })` for tool registration and structured outputs (`response_format: { type: 'json_schema' }`).
+- Added pricing field `cachedInputUSDPer1M` for caching-aware pricing tables (cache-discount math itself deferred to v0.2 with explicit caveat in §9.10).
+- `toMCP()` documented as a v0.2 milestone (waiting on stabilized MCP 1.x prompt resource shape).
+- **Sections changed**: §1 (added `core/tool.ts`), §2.2 (block.cacheBreakpoint, tool, compose options, ChatMessage.cacheControl), §2.5 (`cachedInputUSDPer1M`), §2.7 (adapter outputs), §5.1 (new error codes), §9.8 (cache/tool edge cases 65-70), §11 v0.2 milestones, package.json keywords (added `prompt-caching`, `anthropic-prompt-caching`, `tool-use`, `structured-output`, `json-schema`, `mcp`).
+
+### Medium
+
+**6. `.input<T>()` REPLACES inferred shape — silent footgun.** *Agreed.* Changed semantics:
+- `.input<TOverride extends Partial<TInput>>()` is now **non-destructive** — the override intersects with the inferred shape, narrowing one or two keys without restating every key.
+- Added `.replaceInput<T>()` for the rare destructive case (deep nested objects, dynamic keys).
+- **Sections changed**: §2.1, §1 file-by-file table for `core/prompt.ts`.
+
+**7. Heuristic tokenizer too rough to call this "cost tracking".** *Agreed.*
+- Renamed marketing in package.json `description` from "per-version cost tracking" to "heuristic per-version cost estimation (with optional tiktoken adapter)". Renamed npm keyword `cost-tracking` → `cost-estimation`.
+- Added `estimateTokens()` sibling and exported `roughCost` as an alias of `estimateCost` so callers can pick the name that signals intent at the call site.
+- Shipped `@aikit/prompts/cost/tiktoken` subpath with `tiktokenFor(model): TokenizerFn` that lazy-loads `js-tiktoken` (peer-optional, never bundled into core).
+- `CostEstimate` and `TokenEstimate` now carry `tokenizer: string` and `accuracy: 'rough' | 'exact'` so consumers can tell at runtime which path they're on.
+- §2.5 leads with an explicit "Honesty about the heuristic" callout.
+- **Sections changed**: §1 (new `cost/tiktoken.ts`), §2.5, §6.1, §6.3, §9.10 (edge cases 76-78), package.json description/keywords/exports/peerDeps/devDeps/size-limit.
+
+**8. `httpSource` has no integrity verification.** *Agreed — the KV provider itself is in the threat model.*
+- Added `verify?: VerifyFn` option to `httpSource`. Returning `false` emits a `'change'` event of `type: 'error'` with `code: SOURCE_INTEGRITY_FAILED` and the previous successful load remains active.
+- Shipped a built-in `verifyHmac({ secret, headerName, algorithm?, encoding? })` helper using Web Crypto (`SubtleCrypto`) so it works in every supported runtime.
+- Documented multi-secret rotation pattern as edge case 73.
+- Native Ed25519 verifier deferred to v0.2 (waiting on Web Crypto Ed25519 stabilization across edge runtimes).
+- **Sections changed**: §1 (new `sources/verify.ts`), §2.6, §5.1 (`SOURCE_INTEGRITY_FAILED` code), §9.9 (edge cases 71-75), §11 v0.2.
+
+**9. `assignment.variant` overloads with `'holdout' | 'unassigned'`.** *Agreed.* Subsumed into critical fix #2 — `Assignment` now discriminates on a separate `kind` field. User variant ids can include `'holdout'` without collision.
+
+**10. `validate()` `void` return type footgun.** *Agreed.* Changed signature to `(vars: TInput) => readonly string[]` (empty array means valid). Documented the reasoning in JSDoc — mirrors Zod / Valibot / Effect conventions and makes the contract impossible to forget. **Section changed**: §2.1.
+
+### Low
+
+**11. Async unsubscribe is awkward.** *Agreed.* Changed `subscribe?(listener): () => void` (synchronous unsubscribe) and added optional `dispose?(): Promise<void>` for sources that need async teardown. `registry.addSource()` returns a synchronous unsubscribe; `registry.dispose()` is the async drain. **Sections changed**: §2.3, §2.6.
+
+**12. `sources/memory` at 0.2 KB is over-decomposed.** *Agreed.* Removed the dedicated `./sources/memory` subpath; `memorySource` is now exported from the universal `@aikit/prompts/sources` barrel alongside `verifyHmac`. **Sections changed**: §1, §2.6, §6.1, §6.3, package.json `exports` map.
+
+**13. `PromptBuilder<{}, never, undefined>` exposes ugly internal generics.** *Agreed.* The exported `PromptBuilder<TInput>` is a single-arg user-facing alias. The three internal generics live on a private `_PromptBuilder<TInput, TPartialKeys, TVersion>`. Hovers show resolved input shape via a `Prettify<T>` mapped type. **Sections changed**: §2.1.
+
+### "What's good" notes
+No changes needed — the review's positive call-outs (strict layering rules, FNV-1a, `import type`-only adapters, tagged `PromptError` hierarchy, `pricingDate`, edge case 9.20 prompt-injection-via-template-re-evaluation, the `ExtractVariables<T>` template-literal-types approach) are all preserved.
+
+### Summary of files modified
+- **PLAN.md**: §0 (principle 10), §1 (file tree + responsibility table), §2.1 (builder), §2.2 (block + tool + compose), §2.3 (registry), §2.4 (A/B), §2.5 (cost), §2.6 (sources), §2.7 (adapters), §5.1 (error codes), §5.3 (edge-safe env check), §6.1 (bundle table + rationale), §6.3 (tsup entries), §9.7 / §9.8 / §9.9 / §9.10 / §9.11 (edge cases 65-79), §11 (v0.1 reorder + v0.2 milestones).
+- **package.json**: `description`, `keywords` (added 6, replaced `cost-tracking` → `cost-estimation`), `exports` (added `template-extras`, `cost/tiktoken`; removed `sources/memory`), `peerDependencies` / `peerDependenciesMeta` (added `js-tiktoken`), `devDependencies` (added `js-tiktoken`), `size-limit` (every entry now `gzip: true`, names suffixed `(min+gz)`, core raised to 9 KB hard cap, new `template-extras`/`cost/tiktoken`/`sources` entries, removed `sources/memory`).
+
