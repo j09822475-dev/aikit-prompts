@@ -42,6 +42,20 @@ const params = toOpenAI(greet, { name: 'Alice', count: 3 });
 await new OpenAI().chat.completions.create({ model: 'gpt-4o', ...params });
 ```
 
+## Examples
+
+Five end-to-end runnable examples live in [`examples/`](./examples). Each one runs in this repo with `npx tsx examples/{name}.ts` and has a self-contained sandbox under [`examples/sandbox/{name}/`](./examples/sandbox) that opens in StackBlitz with one click.
+
+| Example | What it shows | Try it |
+|---|---|---|
+| [`basic-usage.ts`](./examples/basic-usage.ts) | Define a typed, versioned prompt; `render` vs `tryRender`; partial application; `toJSON`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/aikit-prompts/tree/main/examples/sandbox/basic-usage) |
+| [`advanced-usage.ts`](./examples/advanced-usage.ts) | Composed system + few-shot + user blocks; tools; structured output; cache breakpoints; typed registry; deterministic A/B split; per-version cost estimation; OpenAI + Anthropic adapter shapes. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/aikit-prompts/tree/main/examples/sandbox/advanced-usage) |
+| [`with-nextjs.ts`](./examples/with-nextjs.ts) | Next.js App Router edge route. `httpSource` + `verifyHmac` (HMAC-SHA-256 over Web Crypto) + `toOpenAI`. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/aikit-prompts/tree/main/examples/sandbox/with-nextjs) |
+| [`with-hono.ts`](./examples/with-hono.ts) | Hono on Cloudflare Workers / Bun. `toAISDK` driving Vercel AI SDK's `generateText`; deterministic A/B split per request. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/aikit-prompts/tree/main/examples/sandbox/with-hono) |
+| [`with-express.ts`](./examples/with-express.ts) | Express + `fsSource` watching a `prompts/**.json` directory. Hot-reload picks up a new version mid-request. | [![Open in StackBlitz](https://developer.stackblitz.com/img/open_in_stackblitz.svg)](https://stackblitz.com/github/j09822475-dev/aikit-prompts/tree/main/examples/sandbox/with-express) |
+
+Every example stubs the LLM call so it runs without API keys — the focus is on the prompt-management surface, not on round-tripping a model.
+
 ## API Reference
 
 ### Core — `@aikit/prompts`
