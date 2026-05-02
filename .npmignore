@@ -1,0 +1,86 @@
+# Source — ship compiled output from `dist/` only
+src
+tests
+benchmarks
+examples
+sandbox
+playground
+
+# Test / coverage
+coverage
+.nyc_output
+.vitest-cache
+*.test.ts
+*.test.js
+*.test-d.ts
+*.spec.ts
+*.spec.js
+__tests__
+__mocks__
+__fixtures__
+
+# Build / TS metadata
+tsconfig.json
+tsconfig.build.json
+tsconfig.*.json
+tsup.config.ts
+tsup.config.js
+vitest.config.ts
+vitest.config.js
+.tsbuildinfo
+*.tsbuildinfo
+
+# Lint / format / size config
+.eslintrc
+.eslintrc.*
+eslint.config.*
+.prettierrc
+.prettierrc.*
+prettier.config.*
+.editorconfig
+.size-limit
+.size-limit.*
+
+# Repo metadata not relevant on npm
+.git
+.gitignore
+.gitattributes
+.github
+.husky
+.changeset
+.vscode
+.idea
+*.swp
+*.swo
+
+# Tooling caches / artifacts
+.cache
+.turbo
+.next
+.nuxt
+.svelte-kit
+.wrangler
+.vercel
+.eslintcache
+.pnpm-store
+.yarn
+.pnp.*
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Env / secrets
+.env
+.env.*
+*.pem
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Internal review notes — PLAN.md is published deliberately (see package.json#files)
+REVIEW.md
