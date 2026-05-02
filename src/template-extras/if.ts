@@ -1,0 +1,78 @@
+import { TemplateError } from '../errors/template-error.js';
+import type { IfNode, TemplateNode } from '../internal/ast.js';
+import {
+  registerBlockDirective,
+  type ParserState,
+} from '../internal/parser.js';
+import { registerDirectiveRenderer } from '../core/template.js';
+import { resolveVar, type RenderContext } from '../core/render-context.js';
+
+const isTruthy = (v: unknown): boolean => {
+  if (v === null || v === undefined) return false;
+  if (v === '' || v === 0 || v === false) return false;
+  if (Array.isArray(v) && v.length === 0) return false;
+  return true;
+};
+
+const installIf = (): void => {
+  registerBlockDirective('if', (state, args, parseChildren): IfNode => {
+    if (args.length === 0) {
+      throw new TemplateError(
+        'TEMPLATE_PARSE',
+        `'{{#if}}' directive requires a variable name`,
+        { position: state.pos },
+      );
+    }
+    const name = args;
+    if (!state.variables.includes(name)) state.variables.push(name);
+    state.optionalSet.add(name);
+
+    const childrenAndElse = parseChildren(state, 'if');
+    const elseIdx = childrenAndElse.findIndex(
+      (n) => n.type === 'text' && n.value === ' ELSE ',
+    );
+    let children: TemplateNode[];
+    let elseChildren: TemplateNode[] | undefined;
+    if (elseIdx >= 0) {
+      children = childrenAndElse.slice(0, elseIdx);
+      elseChildren = childrenAndElse.slice(elseIdx + 1);
+    } else {
+      children = [...childrenAndElse];
+    }
+    return {
+      type: 'if',
+      name,
+      children: Object.freeze(children),
+      ...(elseChildren !== undefined
+        ? { elseChildren: Object.freeze(elseChildren) }
+        : {}),
+    };
+  });
+
+  registerBlockDirective('else', (state: ParserState): IfNode => {
+    throw new TemplateError(
+      'TEMPLATE_PARSE',
+      `'{{#else}}' is not yet supported as a standalone directive`,
+      { position: state.pos },
+    );
+  });
+
+  registerDirectiveRenderer('if', (node, ctx, renderNodes) => {
+    const ifNode = node as IfNode;
+    const value = resolveVar(ctx, ifNode.name);
+    if (isTruthy(value)) return renderNodes(ifNode.children, ctx);
+    if (ifNode.elseChildren) return renderNodes(ifNode.elseChildren, ctx);
+    return '';
+  });
+};
+
+let installed = false;
+
+/**
+ * Install the `{{#if}}` directive into the parser. Idempotent.
+ */
+export const enableIf = (): void => {
+  if (installed) return;
+  installed = true;
+  installIf();
+};
